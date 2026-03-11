@@ -316,8 +316,8 @@ class QwenLocalLLM(OfflineLLM):
 - 第三列是"内容"，必须准确回答用户问题
 - "序号"列必须按行填写数字：1、2、3...
 - "序号"列格式：<sup class="source-ref" data-filename="对应文件名" data-ref="序号">序号</sup>
-- "来源文件"列直接使用完整的文件名
-- **重要**：内容列必须直接、准确地回答用户的问题，不要添加无关信息
+- **【最关键】"来源文件"列必须完全复制参考文档中的"文件名：xxx"，不能有任何修改或简化！**
+- 内容列必须直接、准确地回答用户的问题，不要添加无关信息
 
 表格示例：
 | 序号 | 来源文件 | 内容 |
@@ -325,7 +325,11 @@ class QwenLocalLLM(OfflineLLM):
 | <sup class="source-ref" data-filename="医院感染诊断标准.pdf" data-ref="1">1</sup> | 医院感染诊断标准.pdf | 根据标准，医院感染诊断的具体要求是... |
 | <sup class="source-ref" data-filename="医疗质量管理文件.pdf" data-ref="2">2</sup> | 医疗质量管理文件.pdf | 质量管理指标包括... |
 
-注意：序号列中的 data-filename 必须与对应的来源文件名完全一致！"""
+【重要提醒】
+- 参考文档中"文件名："后面显示的完整文件名就是表格"来源文件"列应该使用的名称
+- 例如：如果参考文档显示"文件名：0-血液净化标准操作规程（2021版）.pdf"，则表格中必须使用"0-血液净化标准操作规程（2021版）.pdf"
+- 不得省略前缀、版本号、括号等任何信息
+- 序号列中的 data-filename 必须与来源文件列的文件名完全一致！"""
 
         try:
             # VL 模型生成
@@ -1227,12 +1231,105 @@ class RAGQA:
             print(f"[DEBUG] full_answer_processed长度: {len(full_answer_processed)}", file=sys.stderr)
             print(f"[DEBUG] full_answer_processed前500字符:\n{full_answer_processed[:500]}", file=sys.stderr)
 
-            # 8. 完成，返回处理后的最终答案（使用处理后的版本）
+            # 8. 验证并修正表格中的文件名
             final_answer = full_answer_processed if full_answer_processed else full_answer
+            if sources:
+                final_answer = self._validate_and_fix_table_filenames(final_answer, sources)
+
+            # 9. 完成，返回处理后的最终答案（使用处理后的版本）
             yield {'type': 'done', 'data': {'sources': sources, 'full_answer': final_answer}}
 
         except Exception as e:
             yield {'type': 'error', 'data': str(e)}
+
+    def _validate_and_fix_table_filenames(self, text: str, sources: list) -> str:
+        """
+        验证并修正表格中的文件名，确保所有文件名都来自 sources 列表
+
+        Args:
+            text: 完整的文本内容（包含表格）
+            sources: 来源列表，每个包含 'filename' 字段
+
+        Returns:
+            修正后的文本
+        """
+        import re
+        import sys
+        from difflib import SequenceMatcher
+
+        # 构建正确的文件名列表
+        valid_filenames = {source['filename']: source for source in sources}
+
+        print(f"[DEBUG FILENAME] ========== 验证文件名 ==========", file=sys.stderr)
+        print(f"[DEBUG FILENAME] 正确的文件名列表: {list(valid_filenames.keys())}", file=sys.stderr)
+
+        # 提取所有表格行
+        table_row_pattern = r'^\|[\s\S]*?\|$'
+        lines = text.split('\n')
+        in_table = False
+        result_lines = []
+
+        for line in lines:
+            # 检测是否在表格中
+            if line.strip().startswith('|') and line.strip().endswith('|'):
+                in_table = True
+            elif in_table and not line.strip():
+                in_table = False
+
+            if in_table and line.strip().startswith('|'):
+                # 分割表格列
+                columns = [col.strip() for col in line.split('|')]
+                # 去掉首尾空元素
+                columns = [col for col in columns if col or col == columns[0]]
+
+                # 假设第二列是"来源文件"列（索引为1）
+                if len(columns) >= 3:
+                    original_filename = columns[1] if len(columns) > 1 else ""
+
+                    # 检查是否是需要验证的文件名
+                    if (original_filename and
+                        original_filename not in ['序号', '来源文件', '内容', '---', ''] and
+                        not original_filename.startswith('<sup') and
+                        not re.match(r'^[\d\s\-_]+$', original_filename)):
+
+                        # 检查是否在有效文件名列表中
+                        if original_filename not in valid_filenames:
+                            print(f"[DEBUG FILENAME] ✗ 文件名无效: {original_filename}", file=sys.stderr)
+
+                            # 尝试找到最相似的文件名
+                            best_match = self._find_best_match_filename(original_filename, valid_filenames.keys())
+
+                            if best_match:
+                                print(f"[DEBUG FILENAME] → 替换为: {best_match}", file=sys.stderr)
+                                columns[1] = columns[1].replace(original_filename, best_match)
+                                line = '|'.join(columns)
+
+                        else:
+                            print(f"[DEBUG FILENAME] ✓ 文件名有效: {original_filename}", file=sys.stderr)
+
+            result_lines.append(line)
+
+        result = '\n'.join(result_lines)
+        return result
+
+    def _find_best_match_filename(self, invalid_name, valid_names, threshold=0.6):
+        """找到最相似的文件名"""
+        from difflib import SequenceMatcher
+
+        best_match = None
+        best_ratio = 0.0
+
+        for valid_name in valid_names:
+            # 计算相似度
+            ratio = SequenceMatcher(None, invalid_name.lower(), valid_name.lower()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = valid_name
+
+        # 相似度阈值检查
+        if best_ratio >= threshold:
+            return best_match
+        return None
 
     def _extract_table_part(self, text: str, sources: list) -> str:
         """
