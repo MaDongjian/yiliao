@@ -39,7 +39,7 @@ class TextSummarizer:
         if model_path is None:
             # 默认使用项目中的模型路径
             project_root = Path(__file__).resolve().parents[1]
-            model_path = project_root / "models" / "Qwen2.5-0.5B-Instruct"
+            model_path = project_root / "models" / "Qwen2.5-7B-Instruct"
 
         self.max_summary_length = max_summary_length
         self.llm = QwenLocalLLM(

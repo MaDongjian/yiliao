@@ -801,7 +801,7 @@ class RAGQA:
 
         return text
 
-    def ask(self, question: str, top_k: int = 8, method: str = "semantic", temperature: float = None, do_sample: bool = None, min_score: float = 0.2) -> Dict:
+    def ask(self, question: str, top_k: int = 12, method: str = "hybrid", temperature: float = None, do_sample: bool = None, min_score: float = 0.15) -> Dict:
         """
         提问并生成答案
 
@@ -918,6 +918,15 @@ class RAGQA:
 
             context = "\n".join(merged_context_parts)
 
+            # 检查是否有有效的 sources
+            if not sources:
+                return {
+                    'question': question,
+                    'answer': "抱歉，我没有找到与您的问题相关的信息。",
+                    'sources': [],
+                    'success': True
+                }
+
             # 3. 检测是否需要表格格式
             use_table_format = self._should_use_table_format(question)
             if use_table_format:
@@ -1032,7 +1041,7 @@ class RAGQA:
                 'success': False
             }
 
-    def ask_stream(self, question: str, top_k: int = 8, method: str = "semantic", temperature: float = None, do_sample: bool = None, min_score: float = 0.2):
+    def ask_stream(self, question: str, top_k: int = 12, method: str = "hybrid", temperature: float = None, do_sample: bool = None, min_score: float = 0.15):
         """
         流式提问并生成答案
 
@@ -1155,14 +1164,34 @@ class RAGQA:
 
             context = "\n".join(merged_context_parts)
 
+            # 检查是否有有效的 sources
+            if not sources:
+                yield {'type': 'content', 'data': "抱歉，我没有找到与您的问题相关的信息。"}
+                yield {'type': 'done', 'data': {'sources': []}}
+                return
+
             # 4. 检测是否需要表格格式
             use_table_format = self._should_use_table_format(question)
             if use_table_format:
+                # 构建可用文件名列表
+                available_filenames = '\n'.join([f"  - {source['filename']}" for source in sources])
+                example_filename = sources[0]['filename']  # 现在安全了，因为已经检查了 sources 非空
+
                 # 在 context 前添加表格格式说明和问题重述
                 table_instruction = f'''
 【重要】请使用 Markdown 表格格式回答，使信息更加清晰易读。
 
 用户问题：{question}
+
+【可用文件名列表】
+以下是你唯一可以使用的文件名白名单，"来源文件"列必须从以下列表中选择，不得使用其他任何文件名：
+{available_filenames}
+
+【【【最关键要求】】】
+- "来源文件"列中的文件名必须从上面的"可用文件名列表"中完全复制
+- 不得修改、简化或创造任何文件名
+- 不得使用不在列表中的文件名
+- 包括前缀、后缀、括号、版本号等都必须完全一致
 
 【回答要求】
 1. 首先准确理解用户的问题意图
@@ -1176,17 +1205,17 @@ class RAGQA:
 3. 第三列标题是"内容"，必须准确回答用户问题
 4. "序号"列必须按行填写数字：1、2、3...
 5. "序号"列格式：<sup class="source-ref" data-filename="对应文件名" data-ref="序号">序号</sup>
-6. "来源文件"列直接使用完整的文件名
+6. "来源文件"列直接使用上面的"可用文件名列表"中的完整文件名
 7. 序号列中的 data-filename 必须与对应的来源文件名完全一致
 
 表格示例：
 | 序号 | 来源文件 | 内容 |
 | --- | --- | --- |
-| <sup class="source-ref" data-filename="医院感染诊断标准.pdf" data-ref="1">1</sup> | 医院感染诊断标准.pdf | 根据标准，具体要求是... |
-| <sup class="source-ref" data-filename="医疗质量管理文件.pdf" data-ref="2">2</sup> | 医疗质量管理文件.pdf | 质量指标包括... |
+| <sup class="source-ref" data-filename="{example_filename}" data-ref="1">1</sup> | {example_filename} | 根据文档，具体要求是... |
 '''
                 context = table_instruction + context
                 print(f"检测到表格关键词，将使用表格格式回答")
+                print(f"[DEBUG] 可用文件名: {[s['filename'] for s in sources]}")
 
             # 5. 返回来源信息
             yield {'type': 'source', 'data': sources}
@@ -1246,70 +1275,135 @@ class RAGQA:
         """
         验证并修正表格中的文件名，确保所有文件名都来自 sources 列表
 
-        Args:
-            text: 完整的文本内容（包含表格）
-            sources: 来源列表，每个包含 'filename' 字段
-
-        Returns:
-            修正后的文本
+        使用更精确的表格解析方法，避免因内容中的 | 字符导致分割错误
         """
         import re
         import sys
         from difflib import SequenceMatcher
 
-        # 构建正确的文件名列表
+        # 构建正确的文件名列表和索引映射
         valid_filenames = {source['filename']: source for source in sources}
+        filename_to_index = {source['filename']: idx + 1 for idx, source in enumerate(sources)}
 
         print(f"[DEBUG FILENAME] ========== 验证文件名 ==========", file=sys.stderr)
         print(f"[DEBUG FILENAME] 正确的文件名列表: {list(valid_filenames.keys())}", file=sys.stderr)
 
-        # 提取所有表格行
-        table_row_pattern = r'^\|[\s\S]*?\|$'
         lines = text.split('\n')
-        in_table = False
         result_lines = []
+        in_table = False
+        table_header_found = False
 
         for line in lines:
-            # 检测是否在表格中
-            if line.strip().startswith('|') and line.strip().endswith('|'):
-                in_table = True
-            elif in_table and not line.strip():
+            stripped_line = line.strip()
+
+            # 检测表格开始/结束
+            if stripped_line.startswith('|') and stripped_line.endswith('|'):
+                if not in_table:
+                    in_table = True
+                    table_header_found = False
+            elif in_table and not stripped_line:
                 in_table = False
+                table_header_found = False
 
-            if in_table and line.strip().startswith('|'):
-                # 分割表格列
-                columns = [col.strip() for col in line.split('|')]
+            # 处理表格行
+            if in_table and stripped_line.startswith('|'):
+                # 检查是否是表头行
+                if '来源文件' in stripped_line or '---' in stripped_line:
+                    table_header_found = True
+                    result_lines.append(line)
+                    continue
+
+                # 只处理数据行（表头之后）
+                if not table_header_found:
+                    result_lines.append(line)
+                    continue
+
+                # 使用正则表达式精确分割表格行
+                # 匹配 | 之间的内容，保留空单元格
+                # 模式：| 内容 | 内容 | 内容 |
+                parts = re.split(r'\|', stripped_line)
                 # 去掉首尾空元素
-                columns = [col for col in columns if col or col == columns[0]]
+                parts = [p.strip() for p in parts if p is not None or len(parts) == 1]
 
-                # 假设第二列是"来源文件"列（索引为1）
-                if len(columns) >= 3:
-                    original_filename = columns[1] if len(columns) > 1 else ""
+                # 至少需要：| 序号 | 来源文件 | 内容 |
+                if len(parts) >= 3:
+                    # 第二列（索引1）应该是"来源文件"
+                    filename_cell = parts[1]
 
-                    # 检查是否是需要验证的文件名
-                    if (original_filename and
-                        original_filename not in ['序号', '来源文件', '内容', '---', ''] and
-                        not original_filename.startswith('<sup') and
-                        not re.match(r'^[\d\s\-_]+$', original_filename)):
+                    # 检查是否是有效的文件名列
+                    is_header_row = (filename_cell in ['序号', '来源文件', '内容', '---', '',
+                                   'No.', '编号', '文件', 'File', 'Source'])
+                    is_sup_cell = filename_cell.startswith('<sup')
+                    is_number_only = re.match(r'^[\d\s]+$', filename_cell)
 
-                        # 检查是否在有效文件名列表中
-                        if original_filename not in valid_filenames:
-                            print(f"[DEBUG FILENAME] ✗ 文件名无效: {original_filename}", file=sys.stderr)
+                    if not is_header_row and not is_sup_cell and not is_number_only:
+                        # 这是一个文件名列，需要验证
+                        if filename_cell not in valid_filenames:
+                            print(f"[DEBUG FILENAME] ✗ 文件名无效: '{filename_cell}'", file=sys.stderr)
 
-                            # 尝试找到最相似的文件名
-                            best_match = self._find_best_match_filename(original_filename, valid_filenames.keys())
+                            # 尝试精确匹配
+                            best_match = self._find_best_match_filename(filename_cell, valid_filenames.keys())
 
                             if best_match:
-                                print(f"[DEBUG FILENAME] → 替换为: {best_match}", file=sys.stderr)
-                                columns[1] = columns[1].replace(original_filename, best_match)
-                                line = '|'.join(columns)
-
+                                print(f"[DEBUG FILENAME] → 替换为: '{best_match}'", file=sys.stderr)
+                                parts[1] = best_match
+                                # 同时修正序号列中的 data-filename（如果存在）
+                                if len(parts) > 0 and '<sup' in parts[0]:
+                                    # 替换 data-filename 属性
+                                    old_filename_pattern = re.escape(filename_cell)
+                                    parts[0] = re.sub(
+                                        rf'data-filename=["\']?{old_filename_pattern}["\']?',
+                                        f'data-filename="{best_match}"',
+                                        parts[0]
+                                    )
+                                # 重建行
+                                line = '|' + '|'.join(parts) + '|'
+                            else:
+                                # 如果找不到匹配，尝试根据编号映射
+                                # 尝试从序号列提取编号
+                                if len(parts) > 0:
+                                    # 从 <sup> 标签中提取编号
+                                    match = re.search(r'data-ref="(\d+)"', parts[0])
+                                    if match:
+                                        ref_num = int(match.group(1))
+                                        if ref_num <= len(sources):
+                                            correct_filename = sources[ref_num - 1]['filename']
+                                            print(f"[DEBUG FILENAME] → 根据编号映射到: '{correct_filename}'", file=sys.stderr)
+                                            parts[1] = correct_filename
+                                            # 同时修正 data-filename
+                                            parts[0] = re.sub(
+                                                rf'data-filename=["\']?[^"\']*["\']?',
+                                                f'data-filename="{correct_filename}"',
+                                                parts[0]
+                                            )
+                                            line = '|' + '|'.join(parts) + '|'
                         else:
-                            print(f"[DEBUG FILENAME] ✓ 文件名有效: {original_filename}", file=sys.stderr)
+                            print(f"[DEBUG FILENAME] ✓ 文件名有效: '{filename_cell}'", file=sys.stderr)
 
             result_lines.append(line)
 
         result = '\n'.join(result_lines)
+
+        # 二次验证：再次检查是否还有未匹配的文件名
+        # 提取所有可能的文件名模式
+        for filename in valid_filenames.keys():
+            # 检查是否有类似的错误文件名
+            escaped_filename = re.escape(filename)
+            # 如果文件名不在结果中，尝试查找相似模式
+            if filename not in result:
+                # 查找可能的错误模式（如缺少前缀、后缀等）
+                filename_base = filename
+                # 移除常见前缀
+                for prefix in ['0-', '1-', '2-', '3-', '4-', '5-', '6-', '7-', '8-', '9-']:
+                    if filename.startswith(prefix):
+                        filename_base = filename[len(prefix):]
+                        break
+
+                # 尝试查找没有前缀的版本
+                if filename_base != filename and filename_base in result:
+                    print(f"[DEBUG FILENAME] 修正: '{filename_base}' -> '{filename}'", file=sys.stderr)
+                    result = result.replace(filename_base, filename)
+
         return result
 
     def _find_best_match_filename(self, invalid_name, valid_names, threshold=0.6):

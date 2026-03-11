@@ -15,6 +15,7 @@ import os
 import sys
 from pathlib import Path
 import json
+from contextlib import nullcontext
 
 # 设置离线模式
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -974,20 +975,14 @@ def query_all_documents(
 
 def upload_files_to_minio(
     source_dir: str = None,
-    date_str: str = None,
-    generate_summary_flag: bool = True,
-    save_to_db: bool = True,
-    force_update: bool = True
+    update_db: bool = True
 ):
     """
-    解析指定目录下的所有文件，提取概要文本并保存到数据库（不涉及MinIO上传）
+    批量解析指定目录下的所有文件，提取详细概要并更新数据库中的summary字段
 
     Args:
         source_dir: 源文件目录（默认为 E:/answerInfo/yiliaozsk1/file_info/test/file_info）
-        date_str: 日期字符串（仅用于标识，格式：YYYY-MM-DD，默认为今天）
-        generate_summary_flag: 是否生成文本概要（默认True）
-        save_to_db: 是否保存到数据库（默认True）
-        force_update: 是否强制更新已存在的记录（默认True，会替换summary）
+        update_db: 是否更新数据库（默认True）
 
     Returns:
         dict: 处理结果
@@ -996,22 +991,18 @@ def upload_files_to_minio(
                   'total_files': 10,
                   'success': 8,
                   'failed': 2,
-                  'updated': 5,
-                  'created': 3,
+                  'updated_db': 8,
                   'results': [...]
               }
 
     示例:
-        # 使用默认目录解析
+        # 使用默认目录
         result = upload_files_to_minio()
 
-        # 使用指定目录解析
+        # 指定目录
         result = upload_files_to_minio(source_dir='E:/documents')
-
-        # 强制重新提取概要并更新数据库
-        result = upload_files_to_minio(force_update=True)
     """
-    from datetime import datetime
+    import time
     import core.database as db_module
     import settings
     from flask import Flask
@@ -1023,16 +1014,11 @@ def upload_files_to_minio(
     else:
         source_dir = Path(source_dir)
 
-    # 默认使用今天的日期（仅用于日志记录）
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y-%m-%d")
-
     print(f"\n{'='*70}")
-    print(f"文档解析提取工具（不涉及MinIO上传）")
+    print(f"批量概要提取工具（更新数据库）")
     print(f"{'='*70}")
     print(f"源目录: {source_dir}")
-    print(f"处理日期: {date_str}")
-    print(f"强制更新: {force_update}")
+    print(f"更新数据库: {'是' if update_db else '否'}")
     print(f"{'='*70}\n")
 
     # 检查源目录是否存在
@@ -1053,8 +1039,7 @@ def upload_files_to_minio(
             'total_files': 0,
             'success': 0,
             'failed': 0,
-            'updated': 0,
-            'created': 0,
+            'updated_db': 0,
             'results': []
         }
 
@@ -1066,154 +1051,151 @@ def upload_files_to_minio(
         'total_files': len(files),
         'success': 0,
         'failed': 0,
-        'updated': 0,
-        'created': 0,
+        'updated_db': 0,
         'results': []
     }
 
     # 创建Flask应用用于数据库操作
-    temp_app = Flask(__name__)
-    temp_app.config.from_object(settings)
-    db_module.db.init_app(temp_app)
+    if update_db:
+        temp_app = Flask(__name__)
+        temp_app.config.from_object(settings)
+        db_module.db.init_app(temp_app)
+
+    # 初始化LLM（复用）
+    llm = None
 
     # 处理每个文件
-    with temp_app.app_context():
-        for file_path in files:
+    with temp_app.app_context() if update_db else nullcontext():
+        for i, file_path in enumerate(files, 1):
             try:
                 print(f"\n{'='*70}")
-                print(f"处理文件: {file_path.name}")
-                print(f"路径: {file_path}")
+                print(f"[{i}/{len(files)}] 处理文件: {file_path.name}")
                 print(f"{'='*70}")
 
-                # 查找数据库中的记录
-                existing_record = DocumentAttribute.query.filter_by(
-                    filename=file_path.name
-                ).first()
-
                 # [1] 解析文件
-                print(f"\n[1/2] 解析文件...")
+                print(f"\n[1/3] 解析文件...")
                 parser = DocumentParser()
-                try:
-                    parsed = parser.parse(str(file_path))
-                    print(f"  解析成功，文本长度: {len(parsed['text'])} 字符")
-                except Exception as e:
-                    print(f"  解析失败: {e}")
-                    result['failed'] += 1
-                    result['results'].append({
-                        'file': str(file_path),
-                        'status': 'error',
-                        'reason': 'parse_failed',
-                        'error': str(e)
-                    })
-                    continue
-
-                # [2] 生成文本概要
-                summary = ""
-
-                if generate_summary_flag:
-                    print(f"\n[2/2] 生成文本概要（千问）...")
-                    try:
-                        import time
-                        summary_start = time.time()
-
-                        # 极速优化：只使用前1000字符生成概要
-                        text_for_summary = parsed['text'][:1000] if len(parsed['text']) > 1000 else parsed['text']
-                        summary = generate_summary(text_for_summary, file_path.name)
-
-                        elapsed = time.time() - summary_start
-                        print(f"  概要生成成功 ({elapsed:.1f}秒): {len(summary)} 字符")
-                        if len(summary) > 60:
-                            print(f"  概要: {summary[:60]}...")
-                        else:
-                            print(f"  概要: {summary}")
-                    except Exception as e:
-                        print(f"  概要生成失败: {e}")
-                        # 快速回退：直接提取前两句
-                        import re
-                        first_part = parsed['text'][:300].strip()
-                        sentences = re.split(r'[。！？]', first_part)
-                        if len(sentences) >= 2:
-                            summary = sentences[0] + '。' + sentences[1] + '。'
-                        else:
-                            summary = sentences[0] + '。' if sentences else first_part[:100]
-                        summary = f"{file_path.name}：{summary}"
-                        print(f"  使用快速回退方案")
-
-                # [3] 保存到数据库
-                db_record_id = None
-                is_updated = False
-                if save_to_db:
-                    print(f"\n[3/3] 保存到数据库...")
-                    try:
-                        if existing_record:
-                            # 更新已存在的记录 - 只替换 summary
-                            print(f"  找到已存在的记录 (ID={existing_record.id})")
-                            if force_update:
-                                # 强制更新：只替换 summary
-                                existing_record.summary = summary
-                                existing_record.text_length = len(parsed['text'])
-                                existing_record.file_type = file_path.suffix.lower().replace('.', '')
-                                existing_record.file_size = file_path.stat().st_size
-                                existing_record.status = 'success'
-                                existing_record.error_message = None
-                                existing_record.updated_at = datetime.utcnow()
-
-                                db_module.db.session.commit()
-                                db_record_id = existing_record.id
-                                is_updated = True
-                                result['updated'] += 1
-                                print(f"  ✓ 数据库记录已更新（summary已替换）: ID={db_record_id}")
-                            else:
-                                print(f"  跳过更新（force_update=False）")
-                                db_record_id = existing_record.id
-                        else:
-                            # 创建新记录
-                            db_record = DocumentAttribute(
-                                filename=file_path.name,
-                                filepath=str(file_path),
-                                summary=summary,
-                                file_type=file_path.suffix.lower().replace('.', ''),
-                                file_size=file_path.stat().st_size,
-                                text_length=len(parsed['text']),
-                                status='success'
-                            )
-
-                            db_module.db.session.add(db_record)
-                            db_module.db.session.commit()
-                            db_record_id = db_record.id
-                            result['created'] += 1
-                            print(f"  ✓ 数据库记录已创建: ID={db_record_id}")
-
-                    except Exception as e:
-                        print(f"  数据库保存失败: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        result['failed'] += 1
-                        continue
-
-                print(f"\n  ✓ 处理成功")
-                result['success'] += 1
-                result['results'].append({
-                    'file': str(file_path),
-                    'status': 'success',
-                    'action': 'updated' if is_updated else 'created',
-                    'summary': summary,
-                    'summary_length': len(summary),
-                    'text_length': len(parsed['text']),
-                    'db_record_id': db_record_id
-                })
+                parsed = parser.parse(str(file_path))
+                text_length = len(parsed['text'])
+                print(f"  ✓ 解析成功")
+                print(f"  文本长度: {text_length} 字符")
 
             except Exception as e:
-                error_msg = f"{file_path.name}: {str(e)}"
-                print(f"  ✗ {error_msg}")
+                print(f"  ✗ 解析失败: {e}")
+                result['failed'] += 1
+                result['results'].append({
+                    'file': str(file_path),
+                    'filename': file_path.name,
+                    'status': 'error',
+                    'reason': 'parse_failed',
+                    'error': str(e)
+                })
+                continue
+
+            # [2] 生成详细概要
+            summary = ""
+            print(f"\n[2/3] 生成文本概要（千问）...")
+            try:
+                summary_start = time.time()
+
+                # 使用完整文本生成概要，确保概括整篇内容
+                text_for_summary = parsed['text']
+
+                if text_length > 3000:
+                    # 取开头1000字符 + 结尾2000字符
+                    part1 = text_for_summary[:1000]
+                    part2 = text_for_summary[-2000:]
+                    text_for_summary = f"{part1}\n\n......\n\n{part2}"
+                    print(f"  文本较长，使用分段提取")
+
+                # 详细的提示词
+                detailed_summary_prompt = f"""文件名：{file_path.name}
+
+请仔细阅读以下文档内容，生成一份详细的概要。要求：
+1. 概要应涵盖文档的完整内容，包括主要章节、核心要点
+2. 概要长度控制在300-600字之间
+3. 使用条理清晰的结构（可分点或分段）
+4. 重点突出文档的核心内容、规范标准、技术要求等关键信息
+5. 保持专业性，避免空洞表述
+
+文档内容：
+{text_for_summary}
+
+请生成详细概要："""
+
+                # 初始化LLM（只初始化一次）
+                if llm is None:
+                    from src.llm_integration import QwenLocalLLM
+                    llm = QwenLocalLLM(
+                        model_path=str(project_root / "models" / "Qwen2.5-7B-Instruct"),
+                        quantization="4bit"
+                    )
+
+                summary = llm.generate(detailed_summary_prompt, context="", max_length=800)
+
+                elapsed = time.time() - summary_start
+                print(f"  ✓ 概要生成成功")
+                print(f"  耗时: {elapsed:.1f}秒")
+                print(f"  概要长度: {len(summary)} 字符")
+
+            except Exception as e:
+                print(f"  ✗ 概要生成失败: {e}")
                 import traceback
                 traceback.print_exc()
                 result['failed'] += 1
                 result['results'].append({
                     'file': str(file_path),
+                    'filename': file_path.name,
                     'status': 'error',
+                    'reason': 'summary_failed',
                     'error': str(e)
                 })
+                continue
+
+            # [3] 打印概要内容
+            print(f"\n[3/3] 概要内容：")
+            print(f"{'='*70}")
+            print(summary)
+            print(f"{'='*70}")
+
+            # [4] 更新数据库
+            if update_db:
+                print(f"\n[4/4] 更新数据库...")
+                try:
+                    # 根据文件名查找记录
+                    record = DocumentAttribute.query.filter_by(
+                        filename=file_path.name
+                    ).first()
+
+                    if record:
+                        # 更新summary字段
+                        old_summary = record.summary
+                        record.summary = summary
+                        db_module.db.session.commit()
+                        result['updated_db'] += 1
+                        print(f"  ✓ 数据库已更新 (ID={record.id})")
+                        if old_summary:
+                            print(f"    旧概要: {old_summary[:50]}...")
+                        print(f"    新概要: {summary[:50]}...")
+                    else:
+                        warning_msg = f"数据库中未找到文件名: {file_path.name}"
+                        print(f"  ⚠ {warning_msg}")
+
+                except Exception as e:
+                    print(f"  ✗ 数据库更新失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # 记录成功结果
+            result['success'] += 1
+            result['results'].append({
+                'file': str(file_path),
+                'filename': file_path.name,
+                'status': 'success',
+                'summary': summary,
+                'summary_length': len(summary),
+                'text_length': text_length
+            })
 
     # 打印汇总
     print(f"\n{'='*70}")
@@ -1222,8 +1204,7 @@ def upload_files_to_minio(
     print(f"  总文件数: {result['total_files']}")
     print(f"  成功: {result['success']}")
     print(f"  失败: {result['failed']}")
-    print(f"  更新记录: {result['updated']}")
-    print(f"  新增记录: {result['created']}")
+    print(f"  数据库更新: {result['updated_db']}")
     print(f"{'='*70}\n")
 
     return result
@@ -1486,6 +1467,6 @@ def upload_to_minio_server(
 
 
 if __name__ == "__main__":
-    upload_to_minio_server()
+    upload_files_to_minio(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/file_info')
 
 

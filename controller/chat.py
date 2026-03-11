@@ -473,6 +473,7 @@ def regenerate_message(message_id):
         """生成 SSE 格式的流式响应"""
         full_answer_parts = []
         collected_sources = None
+        final_full_answer = None  # 用于保存验证后的完整答案
 
         try:
             # 发送原始消息信息
@@ -489,9 +490,11 @@ def regenerate_message(message_id):
                     full_answer_parts.append(chunk.get('data', ''))
                 elif chunk.get('type') == 'source':
                     collected_sources = chunk.get('data')
+                elif chunk.get('type') == 'done':
+                    # 使用 done 事件中已经过文件名验证的完整答案
+                    final_full_answer = chunk.get('data', {}).get('full_answer')
 
-            # 发送完成信号
-            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+            # 发送结束信号
             yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
 
         except GeneratorExit:
@@ -501,9 +504,9 @@ def regenerate_message(message_id):
             yield f"data: {error_chunk}\n\n"
             yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
         finally:
-            # 更新数据库
-            if full_answer_parts:
-                full_answer = ''.join(full_answer_parts)
+            # 更新数据库 - 优先使用验证后的完整答案
+            full_answer = final_full_answer if final_full_answer else ''.join(full_answer_parts)
+            if full_answer:
                 try:
                     ChatService.update_message_answer(
                         msg_id,
