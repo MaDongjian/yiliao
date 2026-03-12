@@ -845,13 +845,8 @@ class RAGQA:
                 level="chunk"
             )
 
-            if not sentence_results and not chunk_results:
-                return {
-                    'question': question,
-                    'answer': "抱歉，我没有找到与您的问题相关的信息。",
-                    'sources': [],
-                    'success': True
-                }
+            # 标记是否检索到相关信息
+            has_context = bool(sentence_results or chunk_results)
 
             # 2. 构建上下文（使用完整的文本内容，不截断）
             context_parts = []
@@ -900,6 +895,29 @@ class RAGQA:
                 else:
                     seen_docs[key] = source.copy()
 
+            # 兜底逻辑：如果过滤后 seen_docs 为空，但检索到了结果
+            # 说明所有结果都被 min_score 过滤了，这时至少保留分数最高的 3 个结果
+            if not seen_docs and (sentence_results or chunk_results):
+                # 合并所有结果并按分数排序
+                all_results = list(sentence_results) + list(chunk_results)
+                all_results.sort(key=lambda x: x['score'], reverse=True)
+
+                # 保留分数最高的 3 个结果
+                for r in all_results[:3]:
+                    text = r['text'].strip()
+                    if text:
+                        key = (r['filename'], r['filepath'])
+                        if key not in seen_docs:
+                            seen_docs[key] = {
+                                'filename': r['filename'],
+                                'filepath': r['filepath'],
+                                'content': text,
+                                'similarity': r['score']
+                            }
+
+                if seen_docs:
+                    print(f"[兜底] 所有结果被 min_score 过滤，保留 top {len(seen_docs)} 结果")
+
             # 添加编号并重新构建 context
             sources = []
             merged_context_parts = []
@@ -918,20 +936,47 @@ class RAGQA:
 
             context = "\n".join(merged_context_parts)
 
-            # 检查是否有有效的 sources
-            if not sources:
-                return {
-                    'question': question,
-                    'answer': "抱歉，我没有找到与您的问题相关的信息。",
-                    'sources': [],
-                    'success': True
-                }
+            # 3. 构建提示词和上下文
+            # 只有当向量库完全没有检索到结果时，才使用通用知识
+            # 如果检索到了结果（即使分数较低），也应该使用这些文档
+            if not has_context:
+                # 向量库完全没有检索到相关信息，使用通用知识回答（富文本段落风格，严禁使用表格）
+                context = f"""你是一个友好的 AI 助手。由于文档库中没有找到与该问题直接相关的信息，请根据你的通用知识回答。
 
-            # 3. 检测是否需要表格格式
-            use_table_format = self._should_use_table_format(question)
-            if use_table_format:
-                # 在 context 前添加表格格式说明
-                table_instruction = '''
+【问题】
+{question}
+
+【重要指示 - 必须严格遵守】
+1. 回答格式：使用富文本段落格式，禁止使用任何表格格式
+2. 严禁使用 Markdown 表格语法（如 |、--- 等符号）
+3. 使用分段落的方式组织内容，每段聚焦一个要点
+4. 适当使用 emoji 让回答更生动（如 📌、💡、⚠️、✅ 等）
+5. 如果涉及医疗健康问题，开头必须说明："⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。"
+6. 绝对不要编造或虚构任何来源文件名称
+
+【回答格式示例】
+⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。
+
+关于您的问题，我来为您解答：
+
+📌 【要点一】
+详细说明...
+
+💡 【要点二】
+详细说明...
+
+✅ 总结
+简要总结...
+
+请按照上述格式直接给出回答：
+"""
+            else:
+                # 有检索到相关信息，使用文档回答
+                # 3. 检测是否需要表格格式
+                use_table_format = self._should_use_table_format(question)
+                if use_table_format:
+                    # 在 context 前添加表格格式说明
+                    table_instruction = '''
 【重要】请使用 Markdown 表格格式回答，使信息更加清晰易读。
 
 表格格式要求：
@@ -945,8 +990,8 @@ class RAGQA:
 | 医院感染诊断标准.pdf | 相关内容... |
 | 医疗质量管理文件.pdf | 相关内容... |
 '''
-                context = table_instruction + context
-                print(f"检测到表格关键词，将使用表格格式回答")
+                    context = table_instruction + context
+                    print(f"检测到表格关键词，将使用表格格式回答")
 
             # 4. 生成回答
             print(f"正在生成回答...")
@@ -1026,12 +1071,21 @@ class RAGQA:
                     answer = re.sub(r'\[来源(\d+)\]', '', answer)
                     answer = re.sub(r'\[(\d+)\]', '', answer)
 
-            return {
-                'question': question,
-                'answer': answer,
-                'sources': sources,
-                'success': True
-            }
+            # 7. 返回结果
+            # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
+            if sources:
+                return {
+                    'question': question,
+                    'answer': answer,
+                    'sources': sources,
+                    'success': True
+                }
+            else:
+                return {
+                    'question': question,
+                    'answer': answer,
+                    'success': True
+                }
 
         except Exception as e:
             return {
@@ -1087,10 +1141,8 @@ class RAGQA:
                 level="chunk"
             )
 
-            if not sentence_results and not chunk_results:
-                yield {'type': 'content', 'data': "抱歉，我没有找到与您的问题相关的信息。"}
-                yield {'type': 'done', 'data': {'sources': []}}
-                return
+            # 标记是否检索到相关信息
+            has_context = bool(sentence_results or chunk_results)
 
             # 3. 先合并相同文档，再构建上下文
             # 使用字典按 (filename, filepath) 合并，避免同一文档出现多次
@@ -1143,6 +1195,29 @@ class RAGQA:
                         }
                     seen_texts.add(text)
 
+            # 兜底逻辑：如果过滤后 seen_docs 为空，但检索到了结果
+            # 说明所有结果都被 min_score 过滤了，这时至少保留分数最高的 3 个结果
+            if not seen_docs and (sentence_results or chunk_results):
+                # 合并所有结果并按分数排序
+                all_results = list(sentence_results) + list(chunk_results)
+                all_results.sort(key=lambda x: x['score'], reverse=True)
+
+                # 保留分数最高的 3 个结果
+                for r in all_results[:3]:
+                    text = r['text'].strip()
+                    if text:
+                        key = (r['filename'], r['filepath'])
+                        if key not in seen_docs:
+                            seen_docs[key] = {
+                                'filename': r['filename'],
+                                'filepath': r['filepath'],
+                                'content': text,
+                                'similarity': r['score']
+                            }
+
+                if seen_docs:
+                    print(f"[兜底] 所有结果被 min_score 过滤，保留 top {len(seen_docs)} 结果")
+
             # 添加编号并重新构建 context（使用合并后的编号）
             sources = []
             merged_context_parts = []
@@ -1164,21 +1239,51 @@ class RAGQA:
 
             context = "\n".join(merged_context_parts)
 
-            # 检查是否有有效的 sources
-            if not sources:
-                yield {'type': 'content', 'data': "抱歉，我没有找到与您的问题相关的信息。"}
-                yield {'type': 'done', 'data': {'sources': []}}
-                return
+            # 4. 构建提示词和上下文
+            # 只有当向量库完全没有检索到结果时，才使用通用知识
+            # 如果检索到了结果（即使分数较低），也应该使用这些文档
+            if not has_context:
+                # 向量库完全没有检索到相关信息，使用通用知识回答（富文本段落风格，严禁使用表格）
+                context = f"""你是一个友好的 AI 助手。由于文档库中没有找到与该问题直接相关的信息，请根据你的通用知识回答。
 
-            # 4. 检测是否需要表格格式
-            use_table_format = self._should_use_table_format(question)
-            if use_table_format:
-                # 构建可用文件名列表
-                available_filenames = '\n'.join([f"  - {source['filename']}" for source in sources])
-                example_filename = sources[0]['filename']  # 现在安全了，因为已经检查了 sources 非空
+【问题】
+{question}
 
-                # 在 context 前添加表格格式说明和问题重述
-                table_instruction = f'''
+【重要指示 - 必须严格遵守】
+1. 回答格式：使用富文本段落格式，禁止使用任何表格格式
+2. 严禁使用 Markdown 表格语法（如 |、--- 等符号）
+3. 使用分段落的方式组织内容，每段聚焦一个要点
+4. 适当使用 emoji 让回答更生动（如 📌、💡、⚠️、✅ 等）
+5. 如果涉及医疗健康问题，开头必须说明："⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。"
+6. 绝对不要编造或虚构任何来源文件名称
+
+【回答格式示例】
+⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。
+
+关于您的问题，我来为您解答：
+
+📌 【要点一】
+详细说明...
+
+💡 【要点二】
+详细说明...
+
+✅ 总结
+简要总结...
+
+请按照上述格式直接给出回答：
+"""
+            else:
+                # 有检索到相关信息，使用文档回答
+                # 4. 检测是否需要表格格式
+                use_table_format = self._should_use_table_format(question)
+                if use_table_format and sources:
+                    # 构建可用文件名列表
+                    available_filenames = '\n'.join([f"  - {source['filename']}" for source in sources])
+                    example_filename = sources[0]['filename']
+
+                    # 在 context 前添加表格格式说明和问题重述
+                    table_instruction = f'''
 【重要】请使用 Markdown 表格格式回答，使信息更加清晰易读。
 
 用户问题：{question}
@@ -1213,14 +1318,22 @@ class RAGQA:
 | --- | --- | --- |
 | <sup class="source-ref" data-filename="{example_filename}" data-ref="1">1</sup> | {example_filename} | 根据文档，具体要求是... |
 '''
-                context = table_instruction + context
-                print(f"检测到表格关键词，将使用表格格式回答")
-                print(f"[DEBUG] 可用文件名: {[s['filename'] for s in sources]}")
+                    context = table_instruction + context
+                    print(f"检测到表格关键词，将使用表格格式回答")
+                    print(f"[DEBUG] 可用文件名: {[s['filename'] for s in sources]}")
+                else:
+                    # 非表格格式，添加简单说明
+                    context = f"用户问题：{question}\n\n" + context
 
-            # 5. 返回来源信息
-            yield {'type': 'source', 'data': sources}
-            _sources_list = sources
-            _has_sources = True
+            # 5. 返回来源信息（只在有来源时返回）
+            if has_context and sources:
+                yield {'type': 'source', 'data': sources}
+                _sources_list = sources
+                _has_sources = True
+            else:
+                # 没有来源时不返回 source 事件
+                _sources_list = []
+                _has_sources = False
 
             # 6. 流式生成回答
             yield {'type': 'status', 'data': '正在生成回答...'}
@@ -1260,13 +1373,17 @@ class RAGQA:
             print(f"[DEBUG] full_answer_processed长度: {len(full_answer_processed)}", file=sys.stderr)
             print(f"[DEBUG] full_answer_processed前500字符:\n{full_answer_processed[:500]}", file=sys.stderr)
 
-            # 8. 验证并修正表格中的文件名
+            # 8. 验证并修正表格中的文件名（只在有来源时处理）
             final_answer = full_answer_processed if full_answer_processed else full_answer
-            if sources:
+            if _has_sources and sources:
                 final_answer = self._validate_and_fix_table_filenames(final_answer, sources)
 
-            # 9. 完成，返回处理后的最终答案（使用处理后的版本）
-            yield {'type': 'done', 'data': {'sources': sources, 'full_answer': final_answer}}
+            # 9. 完成，返回处理后的最终答案
+            # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
+            if _has_sources:
+                yield {'type': 'done', 'data': {'sources': sources, 'full_answer': final_answer}}
+            else:
+                yield {'type': 'done', 'data': {'full_answer': final_answer}}
 
         except Exception as e:
             yield {'type': 'error', 'data': str(e)}
