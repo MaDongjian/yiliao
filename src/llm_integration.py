@@ -992,6 +992,17 @@ class RAGQA:
 '''
                     context = table_instruction + context
                     print(f"检测到表格关键词，将使用表格格式回答")
+                else:
+                    # 非表格格式，添加明确的禁止表格指示
+                    context = f"""【重要指示】
+- 请使用富文本段落格式回答，严禁使用任何表格格式
+- 禁止使用 Markdown 表格语法（如 |、--- 等符号）
+- 使用分段落、分要点的方式组织内容，适当使用 emoji（如 📌、💡、⚠️、✅ 等）
+- 回答将在最后自动添加来源文件列表
+
+用户问题：{question}
+
+{context}"""
 
             # 4. 生成回答
             print(f"正在生成回答...")
@@ -1071,7 +1082,29 @@ class RAGQA:
                     answer = re.sub(r'\[来源(\d+)\]', '', answer)
                     answer = re.sub(r'\[(\d+)\]', '', answer)
 
-            # 7. 返回结果
+            # 7. 添加来源列表（纯文本格式时）
+            # 检测是否使用了表格格式（更精确的检测）
+            has_table = False
+            if '|' in answer:
+                # 检查是否有表格分隔线
+                if '| --- |' in answer or '|---|' in answer:
+                    # 检查是否有表头（来源文件列）
+                    if '| 来源文件 |' in answer or '|来源文件|' in answer:
+                        has_table = True
+
+            # 如果不是表格格式且有来源文件，在答案最后添加来源列表
+            if sources and not has_table:
+                # 构建来源列表，添加 <sup> 标签
+                sources_list = "\n\n---\n\n**来源文件：**\n\n"
+                for idx, source in enumerate(sources, 1):
+                    filename = source['filename']
+                    # 添加带属性的 sup 标签
+                    sup_tag = f'<sup class="source-ref" data-filename="{filename}" data-ref="{idx}">{idx}</sup>'
+                    # 使用 <br> 确保HTML渲染时换行
+                    sources_list += f"{sup_tag}. {filename}<br>\n"
+                answer += sources_list
+
+            # 8. 返回结果
             # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
             if sources:
                 return {
@@ -1322,8 +1355,16 @@ class RAGQA:
                     print(f"检测到表格关键词，将使用表格格式回答")
                     print(f"[DEBUG] 可用文件名: {[s['filename'] for s in sources]}")
                 else:
-                    # 非表格格式，添加简单说明
-                    context = f"用户问题：{question}\n\n" + context
+                    # 非表格格式，添加明确的禁止表格指示
+                    context = f"""【重要指示】
+- 请使用富文本段落格式回答，严禁使用任何表格格式
+- 禁止使用 Markdown 表格语法（如 |、--- 等符号）
+- 使用分段落、分要点的方式组织内容，适当使用 emoji（如 📌、💡、⚠️、✅ 等）
+- 回答将在最后自动添加来源文件列表
+
+用户问题：{question}
+
+{context}"""
 
             # 5. 返回来源信息（只在有来源时返回）
             if has_context and sources:
@@ -1375,10 +1416,45 @@ class RAGQA:
 
             # 8. 验证并修正表格中的文件名（只在有来源时处理）
             final_answer = full_answer_processed if full_answer_processed else full_answer
+
+            # 检测是否使用了表格格式
+            # 更精确的表格检测：需要同时满足多个条件
+            has_table = False
+            if '|' in final_answer:
+                # 检查是否有表格分隔线
+                if '| --- |' in final_answer or '|---|' in final_answer:
+                    # 检查是否有表头（来源文件列）
+                    if '| 来源文件 |' in final_answer or '|来源文件|' in final_answer:
+                        has_table = True
+
+            import sys
+            print(f"[DEBUG SOURCES] _has_sources={_has_sources}, sources数量={len(sources) if sources else 0}, has_table={has_table}", file=sys.stderr)
+            print(f"[DEBUG SOURCES] 最终答案包含 | : {'|' in final_answer}", file=sys.stderr)
+            print(f"[DEBUG SOURCES] 最终答案包含 '来源文件': {'来源文件' in final_answer}", file=sys.stderr)
+
             if _has_sources and sources:
                 final_answer = self._validate_and_fix_table_filenames(final_answer, sources)
 
-            # 9. 完成，返回处理后的最终答案
+            # 9. 添加来源列表（纯文本格式时）
+            # 如果不是表格格式且有来源文件，在答案最后添加来源列表
+            sources_list = ""
+            if _has_sources and sources and not has_table:
+                # 构建来源列表，添加 <sup> 标签
+                sources_list = "\n\n---\n\n**来源文件：**\n\n"
+                for idx, source in enumerate(sources, 1):
+                    filename = source['filename']
+                    # 添加带属性的 sup 标签
+                    sup_tag = f'<sup class="source-ref" data-filename="{filename}" data-ref="{idx}">{idx}</sup>'
+                    # 使用 <br> 确保HTML渲染时换行
+                    sources_list += f"{sup_tag}. {filename}<br>\n"
+                final_answer += sources_list
+                print(f"[DEBUG SOURCES] 已添加来源列表，来源数量：{len(sources)}", file=sys.stderr)
+                print(f"[DEBUG SOURCES] 最终答案长度：{len(final_answer)}", file=sys.stderr)
+
+                # 额外发送来源列表作为 content 事件（确保前端能显示）
+                yield {'type': 'content', 'data': sources_list}
+
+            # 10. 完成，返回处理后的最终答案
             # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
             if _has_sources:
                 yield {'type': 'done', 'data': {'sources': sources, 'full_answer': final_answer}}
