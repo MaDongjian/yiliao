@@ -1160,6 +1160,9 @@ class RAGQA:
             yield {'type': 'status', 'data': '正在搜索相关文档...'}
 
             # 2. 检索相关文档
+            import time
+            search_start = time.time()
+
             sentence_results = self.search_model.search(
                 question,
                 method=method,
@@ -1173,6 +1176,9 @@ class RAGQA:
                 top_k=max(2, top_k - 1),
                 level="chunk"
             )
+
+            import sys
+            print(f"[PERF] 检索耗时: {((time.time() - search_start) * 1000):.1f}ms, 结果数: {len(sentence_results)} + {len(chunk_results)}", file=sys.stderr)
 
             # 标记是否检索到相关信息
             has_context = bool(sentence_results or chunk_results)
@@ -1251,6 +1257,9 @@ class RAGQA:
                 if seen_docs:
                     print(f"[兜底] 所有结果被 min_score 过滤，保留 top {len(seen_docs)} 结果")
 
+            import time
+            merge_start = time.time()
+
             # 添加编号并重新构建 context（使用合并后的编号）
             sources = []
             merged_context_parts = []
@@ -1271,6 +1280,9 @@ class RAGQA:
                 )
 
             context = "\n".join(merged_context_parts)
+
+            import sys
+            print(f"[PERF] 文档合并耗时: {((time.time() - merge_start) * 1000):.1f}ms, 合并后文档数: {len(sources)}", file=sys.stderr)
 
             # 4. 构建提示词和上下文
             # 只有当向量库完全没有检索到结果时，才使用通用知识
@@ -1345,11 +1357,18 @@ class RAGQA:
 5. "序号"列格式：<sup class="source-ref" data-filename="对应文件名" data-ref="序号">序号</sup>
 6. "来源文件"列直接使用上面的"可用文件名列表"中的完整文件名
 7. 序号列中的 data-filename 必须与对应的来源文件名完全一致
+8. 内容列中的文本需要换行时，请使用 HTML <br> 标签（不是 \\n）
+
+【【【关键：一行一文件】】】
+- 每个来源文件在表格中只能出现一行
+- 即使某个文件包含多条相关信息，也必须合并到该文件的那一行中
+- 禁止为同一个文件生成多行表格
+- 在"内容"列中使用 <br> 标签连接同一文件的多条信息
 
 表格示例：
 | 序号 | 来源文件 | 内容 |
 | --- | --- | --- |
-| <sup class="source-ref" data-filename="{example_filename}" data-ref="1">1</sup> | {example_filename} | 根据文档，具体要求是... |
+| <sup class="source-ref" data-filename="{example_filename}" data-ref="1">1</sup> | {example_filename} | 根据文档，具体要求是...<br>第二行内容（如果有的话） |
 '''
                     context = table_instruction + context
                     print(f"检测到表格关键词，将使用表格格式回答")
@@ -1379,29 +1398,38 @@ class RAGQA:
             # 6. 流式生成回答
             yield {'type': 'status', 'data': '正在生成回答...'}
 
+            # 先检测是否会使用表格格式
+            use_table_format = self._should_use_table_format(question)
+
             full_answer = ""
             full_answer_processed = ""  # 保存处理后的完整答案
+
+            import time
+            generate_start = time.time()
 
             for text_chunk, is_finished in self.llm.generate(question, context, stream=True, temperature=temperature, do_sample=do_sample):
                 if text_chunk and not is_finished:
                     # 使用缓冲区处理跨块的引用
                     _buffer += text_chunk
-                    # 处理时暂时不处理表格（因为表格可能不完整）
                     processed = self._process_buffer(_buffer, _sources_list if _has_sources else None, False)
-                    # 发送已处理的部分
+
                     if processed['output']:
+                        output_text = processed['output']
+                        full_answer_processed += output_text
+
+                        # 正常流式发送（不再检测重复，因为LLM已被指示每个文件只生成一行）
                         yield {'type': 'content', 'data': processed['output']}
-                        full_answer_processed += processed['output']  # 累加处理后的内容
-                    # 保留未处理的部分
+
                     _buffer = processed['remaining']
                     full_answer += text_chunk
+
                 if is_finished:
                     # 处理剩余的缓冲区内容
                     if _buffer:
                         processed = self._process_buffer(_buffer, _sources_list if _has_sources else None, False)
                         if processed['output']:
                             yield {'type': 'content', 'data': processed['output']}
-                            full_answer_processed += processed['output']  # 累加最后的处理内容
+                            full_answer_processed += processed['output']
                         _buffer = ""
                     if text_chunk and not full_answer:
                         full_answer = text_chunk
@@ -1409,6 +1437,8 @@ class RAGQA:
 
             # 7. 流式输出结束
             import sys
+            generate_time = (time.time() - generate_start) * 1000
+            print(f"[PERF] LLM生成耗时: {generate_time:.1f}ms, 生成字符数: {len(full_answer_processed)}", file=sys.stderr)
             print(f"[DEBUG] ========== 流式结束 ==========", file=sys.stderr)
             print(f"[DEBUG] full_answer原始长度: {len(full_answer)}", file=sys.stderr)
             print(f"[DEBUG] full_answer_processed长度: {len(full_answer_processed)}", file=sys.stderr)
@@ -1432,8 +1462,13 @@ class RAGQA:
             print(f"[DEBUG SOURCES] 最终答案包含 | : {'|' in final_answer}", file=sys.stderr)
             print(f"[DEBUG SOURCES] 最终答案包含 '来源文件': {'来源文件' in final_answer}", file=sys.stderr)
 
-            if _has_sources and sources:
-                final_answer = self._validate_and_fix_table_filenames(final_answer, sources)
+            # 表格格式：验证文件名（不合并，因为已在检索阶段合并）
+            if _has_sources and sources and has_table:
+                import time
+                validate_start = time.time()
+                final_answer = self._validate_table_filenames_only(final_answer, sources)
+                validate_time = (time.time() - validate_start) * 1000
+                print(f"[PERF] 文件名验证耗时: {validate_time:.1f}ms", file=sys.stderr)
 
             # 9. 添加来源列表（纯文本格式时）
             # 如果不是表格格式且有来源文件，在答案最后添加来源列表
@@ -1456,6 +1491,7 @@ class RAGQA:
 
             # 10. 完成，返回处理后的最终答案
             # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
+
             if _has_sources:
                 yield {'type': 'done', 'data': {'sources': sources, 'full_answer': final_answer}}
             else:
@@ -1575,6 +1611,100 @@ class RAGQA:
 
             result_lines.append(line)
 
+        # 分组合并：按来源文件合并相同文件的多行内容
+        # 只有当存在表格时才执行分组逻辑
+        table_start_idx = None
+        table_end_idx = None
+
+        # 查找表格边界
+        for idx, line in enumerate(result_lines):
+            stripped = line.strip()
+            if stripped.startswith('|') and stripped.endswith('|'):
+                if table_start_idx is None:
+                    table_start_idx = idx
+                table_end_idx = idx
+            elif table_start_idx is not None:
+                break  # 表格结束
+
+        if table_start_idx is not None and table_end_idx is not None:
+            # 提取表格部分
+            table_lines = result_lines[table_start_idx:table_end_idx + 1]
+
+            # 解析表格：找出表头、分隔符、数据行
+            header_line = None
+            separator_line = None
+            data_rows = []
+
+            for i, line in enumerate(table_lines):
+                stripped = line.strip()
+                if '来源文件' in stripped:
+                    header_line = line
+                elif '---' in stripped:
+                    separator_line = line
+                elif stripped.startswith('|') and header_line is not None:
+                    # 这是数据行
+                    data_rows.append(line)
+
+            if header_line and separator_line and data_rows:
+                # 解析数据行，按来源文件分组
+                from collections import defaultdict
+
+                # 存储分组数据: {filename: {'序号': xxx, '内容': [content1, content2, ...]}}
+                grouped_data = defaultdict(lambda: {'序号': None, '内容列表': []})
+
+                for row in data_rows:
+                    # 解析行: | 序号 | 来源文件 | 内容 |
+                    parts = [p.strip() for p in row.split('|')]
+                    parts = [p for p in parts if p or len(parts) <= 3]  # 保留空单元格但去掉首尾空
+
+                    if len(parts) >= 3:
+                        number_cell = parts[0]
+                        filename_cell = parts[1]
+                        content_cell = parts[2] if len(parts) > 2 else ''
+
+                        # 跳过表头重复行
+                        if filename_cell in ['序号', '来源文件', '内容', 'No.', '文件']:
+                            continue
+
+                        # 提取序号中的 data-ref 编号
+                        import re
+                        ref_match = re.search(r'data-ref="(\d+)"', number_cell)
+                        ref_num = int(ref_match.group(1)) if ref_match else None
+
+                        # 按文件名分组
+                        grouped_data[filename_cell]['序号'] = number_cell
+                        grouped_data[filename_cell]['ref_num'] = ref_num
+                        grouped_data[filename_cell]['内容列表'].append(content_cell)
+
+                # 重建表格：合并相同文件的内容
+                new_table_lines = [header_line, separator_line]
+
+                # 按 ref_num 排序
+                sorted_items = sorted(grouped_data.items(), key=lambda x: x[1]['ref_num'] if x[1]['ref_num'] else 999)
+
+                for filename, data in sorted_items:
+                    # 合并内容：在 Markdown 表格中使用 <br> 标签换行
+                    # 注意：表格中不能直接使用 \n 换行，必须使用 HTML <br> 标签
+                    if len(data['内容列表']) > 1:
+                        merged_content = '<br><br>'.join(data['内容列表'])
+                    else:
+                        merged_content = data['内容列表'][0]
+
+                    # 构建新行
+                    new_row = f'| {data["序号"]} | {filename} | {merged_content} |'
+                    new_table_lines.append(new_row)
+
+                    print(f"[DEBUG MERGE] 合并文件: {filename}, 内容块数: {len(data['内容列表'])}", file=sys.stderr)
+
+                # 替换原表格
+                result_lines = (
+                    result_lines[:table_start_idx] +
+                    new_table_lines +
+                    result_lines[table_end_idx + 1:]
+                )
+
+                print(f"[DEBUG MERGE] 表格分组完成，原始行数: {len(data_rows)}, 合并后行数: {len(sorted_items)}", file=sys.stderr)
+
         result = '\n'.join(result_lines)
 
         # 二次验证：再次检查是否还有未匹配的文件名
@@ -1599,6 +1729,96 @@ class RAGQA:
 
         return result
 
+    def _validate_table_filenames_only(self, text: str, sources: list) -> str:
+        """
+        只验证和修正表格中的文件名，不做合并
+
+        比 _validate_and_fix_table_filenames 更快，因为：
+        1. 不检测和合并重复文件（已在检索阶段合并）
+        2. 只验证文件名是否在白名单中
+        3. 只修正错误的文件名
+
+        Args:
+            text: 完整文本内容
+            sources: 来源列表
+
+        Returns:
+            验证后的文本
+        """
+        import re
+        import sys
+        from difflib import SequenceMatcher
+
+        # 构建正确的文件名列表
+        valid_filenames = {source['filename']: source for source in sources}
+
+        print(f"[DEBUG VALIDATE] 验证文件名，正确列表: {list(valid_filenames.keys())}", file=sys.stderr)
+
+        lines = text.split('\n')
+        result_lines = []
+        in_table = False
+
+        for line in lines:
+            stripped_line = line.strip()
+
+            # 检测表格开始/结束
+            if stripped_line.startswith('|') and stripped_line.endswith('|'):
+                if not in_table:
+                    in_table = True
+            elif in_table and not stripped_line:
+                in_table = False
+                result_lines.append(line)  # 保留空行
+                continue
+
+            # 处理表格行
+            if in_table and stripped_line.startswith('|'):
+                # 检查是否是表头或分隔符行
+                if '来源文件' in stripped_line or '---' in stripped_line:
+                    result_lines.append(line)
+                    continue
+
+                # 使用正则表达式精确分割表格行
+                parts = re.split(r'\|', stripped_line)
+                parts = [p.strip() for p in parts if p is not None or len(parts) == 1]
+
+                # 至少需要：| 序号 | 来源文件 | 内容 |
+                if len(parts) >= 3:
+                    # 第二列（索引1）应该是"来源文件"
+                    filename_cell = parts[1]
+
+                    # 检查是否是表头行
+                    is_header_row = (filename_cell in ['序号', '来源文件', '内容', '---', '',
+                                   'No.', '编号', '文件', 'File', 'Source'])
+                    is_sup_cell = filename_cell.startswith('<sup')
+                    is_number_only = re.match(r'^[\d\s]+$', filename_cell)
+
+                    if not is_header_row and not is_sup_cell and not is_number_only:
+                        # 这是一个文件名列，需要验证
+                        if filename_cell not in valid_filenames:
+                            print(f"[DEBUG VALIDATE] ✗ 文件名无效: '{filename_cell}'", file=sys.stderr)
+
+                            # 尝试精确匹配
+                            best_match = self._find_best_match_filename(filename_cell, valid_filenames.keys())
+
+                            if best_match:
+                                print(f"[DEBUG VALIDATE] → 替换为: '{best_match}'", file=sys.stderr)
+                                parts[1] = best_match
+                                # 同时修正序号列中的 data-filename
+                                if len(parts) > 0 and '<sup' in parts[0]:
+                                    old_filename_pattern = re.escape(filename_cell)
+                                    parts[0] = re.sub(
+                                        rf'data-filename=["\']?{old_filename_pattern}["\']?',
+                                        f'data-filename="{best_match}"',
+                                        parts[0]
+                                    )
+                                # 重建行
+                                line = '|' + '|'.join(parts) + '|'
+
+            result_lines.append(line)
+
+        result = '\n'.join(result_lines)
+        return result
+
     def _find_best_match_filename(self, invalid_name, valid_names, threshold=0.6):
         """找到最相似的文件名"""
         from difflib import SequenceMatcher
@@ -1617,6 +1837,164 @@ class RAGQA:
         if best_ratio >= threshold:
             return best_match
         return None
+
+    def _merge_table_rows(self, table_rows: list, seen_filenames: dict) -> str:
+        """
+        合并表格中相同来源文件的多行内容
+
+        Args:
+            table_rows: 表格行列表
+            seen_filenames: 已见文件名映射
+
+        Returns:
+            合并后的完整表格字符串（包含表头）
+        """
+        import sys
+        from collections import defaultdict
+
+        # 解析表格，分离表头、分隔符、数据行
+        header_line = None
+        separator_line = None
+        data_rows = []
+
+        for row in table_rows:
+            stripped = row.strip()
+            if not stripped:
+                continue
+
+            if '来源文件' in stripped and '|' in stripped:
+                header_line = stripped
+            elif '---' in stripped and '|' in stripped:
+                separator_line = stripped
+            elif stripped.startswith('|') and stripped.endswith('|'):
+                data_rows.append(stripped)
+
+        if not header_line or not separator_line or not data_rows:
+            return None
+
+        # 按来源文件分组
+        grouped_data = defaultdict(lambda: {'序号': None, '内容列表': []})
+
+        for row in data_rows:
+            parts = [p.strip() for p in row.split('|')]
+            parts = [p for p in parts if p or len(parts) <= 3]
+
+            if len(parts) >= 3:
+                number_cell = parts[0]
+                filename_cell = parts[1]
+                content_cell = parts[2] if len(parts) > 2 else ''
+
+                if filename_cell in ['序号', '来源文件', '内容', 'No.']:
+                    continue
+
+                # 提取序号中的 data-ref 编号
+                import re
+                ref_match = re.search(r'data-ref="(\d+)"', number_cell)
+                ref_num = int(ref_match.group(1)) if ref_match else 999
+
+                grouped_data[filename_cell]['序号'] = number_cell
+                grouped_data[filename_cell]['ref_num'] = ref_num
+                grouped_data[filename_cell]['内容列表'].append(content_cell)
+
+        # 重建表格
+        result_lines = [header_line, separator_line]
+
+        # 按 ref_num 排序
+        sorted_items = sorted(grouped_data.items(), key=lambda x: x[1]['ref_num'])
+
+        for filename, data in sorted_items:
+            # 合并内容：使用 <br> 标签
+            if len(data['内容列表']) > 1:
+                merged_content = '<br><br>'.join(data['内容列表'])
+            else:
+                merged_content = data['内容列表'][0] if data['内容列表'] else ''
+
+            new_row = f"| {data['序号']} | {filename} | {merged_content} |"
+            result_lines.append(new_row)
+
+            if len(data['内容列表']) > 1:
+                print(f"[DEBUG MERGE STREAM] 合并文件: {filename}, 内容块数: {len(data['内容列表'])}", file=sys.stderr)
+
+        return '\n'.join(result_lines) + '\n'
+
+    def _merge_table_content(self, table_content: str) -> str:
+        """
+        合并表格内容中相同来源文件的多行
+
+        Args:
+            table_content: 完整的表格内容字符串
+
+        Returns:
+            合并后的表格内容
+        """
+        import sys
+        import re
+        from collections import defaultdict
+
+        lines = table_content.split('\n')
+        header_line = None
+        separator_line = None
+        data_rows = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            if '来源文件' in stripped and '|' in stripped:
+                header_line = stripped
+            elif '---' in stripped and '|' in stripped:
+                separator_line = stripped
+            elif stripped.startswith('|') and stripped.endswith('|'):
+                data_rows.append(stripped)
+
+        if not header_line or not separator_line or not data_rows:
+            return table_content  # 不是完整的表格，返回原内容
+
+        # 按来源文件分组
+        grouped_data = defaultdict(lambda: {'序号': None, '内容列表': [], 'ref_num': 999})
+
+        for row in data_rows:
+            # 提取序号、文件名、内容
+            parts = [p.strip() for p in row.split('|')]
+            parts = [p for p in parts if p or len(parts) <= 3]
+
+            if len(parts) >= 3:
+                number_cell = parts[0]
+                filename_cell = parts[1]
+                content_cell = parts[2] if len(parts) > 2 else ''
+
+                if filename_cell in ['序号', '来源文件', '内容', 'No.']:
+                    continue
+
+                # 提取 data-ref 编号
+                ref_match = re.search(r'data-ref="(\d+)"', number_cell)
+                ref_num = int(ref_match.group(1)) if ref_match else 999
+
+                grouped_data[filename_cell]['序号'] = number_cell
+                grouped_data[filename_cell]['ref_num'] = ref_num
+                grouped_data[filename_cell]['内容列表'].append(content_cell)
+
+        # 重建表格
+        result_lines = [header_line, separator_line]
+
+        # 按 ref_num 排序
+        sorted_items = sorted(grouped_data.items(), key=lambda x: x[1]['ref_num'])
+
+        for filename, data in sorted_items:
+            # 合并内容：使用 <br> 标签（在 Markdown 表格中正确换行）
+            if len(data['内容列表']) > 1:
+                merged_content = '<br><br>'.join(data['内容列表'])
+            else:
+                merged_content = data['内容列表'][0] if data['内容列表'] else ''
+
+            new_row = f"| {data['序号']} | {filename} | {merged_content} |"
+            result_lines.append(new_row)
+
+            if len(data['内容列表']) > 1:
+                print(f"[DEBUG MERGE STREAM] 合并文件: {filename}, 内容块数: {len(data['内容列表'])}", file=sys.stderr)
+
+        return '\n'.join(result_lines)
 
     def _extract_table_part(self, text: str, sources: list) -> str:
         """
