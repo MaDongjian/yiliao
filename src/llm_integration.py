@@ -5,6 +5,7 @@ LLM 集成模块 - 离线大模型问答
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -240,25 +241,42 @@ class QwenLocalLLM(OfflineLLM):
                     "local_files_only": True
                 }
 
-                # Windows CUDA 环境：不使用 device_map="auto"，直接手动移动模型到 GPU
+                # GPU 环境配置
                 if device == "cuda":
-                    load_kwargs["torch_dtype"] = torch.float16
-                else:
+                    # 使用 device_map="auto" 自动分配到 GPU（推荐方式）
                     load_kwargs["device_map"] = "auto"
+                    load_kwargs["torch_dtype"] = torch.float16
 
-                # 添加量化配置
-                if quantization_config and device == "cuda":
-                    load_kwargs["quantization_config"] = quantization_config
+                    # 添加量化配置（GPU上推荐使用4bit量化）
+                    if quantization_config:
+                        load_kwargs["quantization_config"] = quantization_config
+                        print(f"✓ GPU模式：启用{self.quantization}量化")
+                    else:
+                        print("✓ GPU模式：使用FP16精度（未启用量化）")
+                else:
+                    # CPU 模式
+                    load_kwargs["device_map"] = "auto"
+                    load_kwargs["torch_dtype"] = torch.float32
+                    print("⚠ CPU模式：生成速度会很慢，建议使用GPU")
+
+                print(f"模型加载配置: {list(load_kwargs.keys())}")
 
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path_str,
                     **load_kwargs
                 )
-                # 手动移动模型到 GPU（避免 device_map="auto" 在 Windows 上的问题）
+
+                # 验证模型确实在正确的设备上
                 if device == "cuda":
-                    print("正在移动模型到 GPU...")
-                    self.model = self.model.to('cuda')
-                    print(f"模型已移动到: {next(self.model.parameters()).device}")
+                    model_device = next(self.model.parameters()).device
+                    print(f"✓ 模型已加载到设备: {model_device}")
+                    if 'cuda' not in str(model_device):
+                        print(f"❌ 警告：期望GPU但模型在 {model_device}")
+                        # 强制移动到GPU
+                        print("正在强制移动模型到GPU...")
+                        self.model = self.model.to('cuda')
+                        model_device = next(self.model.parameters()).device
+                        print(f"✓ 模型已移动到: {model_device}")
                 self.is_vl_model = False
 
             print(f"模型加载成功，设备: {device}, VL模型: {getattr(self, 'is_vl_model', False)}")
@@ -377,9 +395,11 @@ class QwenLocalLLM(OfflineLLM):
                     # 确定采样策略
                     use_sample = do_sample if do_sample is not None else False
                     temp = temperature if temperature is not None else (0.9 if use_sample else 1.0)
+                    # 创建表格行计数器
+                    table_row_counter = {'count': 0, 'in_table': False}
                     return self._stream_generate(
                         self.model, inputs, base_tokenizer, input_length, max_length,
-                        do_sample=use_sample, temperature=temp
+                        do_sample=use_sample, temperature=temp, table_row_counter=table_row_counter
                     )
 
                 # 非流式生成
@@ -431,9 +451,11 @@ class QwenLocalLLM(OfflineLLM):
                 # 确定采样策略
                 use_sample = do_sample if do_sample is not None else False
                 temp = temperature if temperature is not None else (0.9 if use_sample else 1.0)
+                # 创建表格行计数器
+                table_row_counter = {'count': 0, 'in_table': False}
                 return self._stream_generate(
                     self.model, inputs, self.tokenizer, input_length, stream_max_length,
-                    do_sample=use_sample, temperature=temp
+                    do_sample=use_sample, temperature=temp, table_row_counter=table_row_counter
                 )
 
             # 非流式生成
@@ -495,9 +517,11 @@ class QwenLocalLLM(OfflineLLM):
                     # 确定采样策略
                     use_sample = do_sample if do_sample is not None else False
                     temp = temperature if temperature is not None else (0.9 if use_sample else 1.0)
+                    # 创建表格行计数器
+                    table_row_counter = {'count': 0, 'in_table': False}
                     return self._stream_generate(
                         self.model, inputs, self.tokenizer, input_length, max_length,
-                        do_sample=use_sample, temperature=temp
+                        do_sample=use_sample, temperature=temp, table_row_counter=table_row_counter
                     )
 
                 print(f"[DEBUG FALLBACK] 开始生成...")
@@ -521,7 +545,7 @@ class QwenLocalLLM(OfflineLLM):
                 error_msg = f"千问模型生成失败: {e2}\n\n详细错误:\n{traceback.format_exc()}"
                 raise Exception(error_msg)
 
-    def _stream_generate(self, model, inputs, tokenizer, input_length, max_length, do_sample=False, temperature=1.0):
+    def _stream_generate(self, model, inputs, tokenizer, input_length, max_length, do_sample=False, temperature=1.0, table_row_counter=None):
         """
         流式生成器的内部实现
 
@@ -533,6 +557,7 @@ class QwenLocalLLM(OfflineLLM):
             max_length: 最大生成长度
             do_sample: 是否使用采样（添加随机性）
             temperature: 采样温度
+            table_row_counter: 表格行计数器字典 {'count': 0, 'in_table': False}
 
         Yields:
             (text_chunk: str, is_finished: bool)
@@ -542,9 +567,16 @@ class QwenLocalLLM(OfflineLLM):
         import threading
         import time
         import queue
+        import re
+
+        # 初始化表格行计数器（如果未提供）
+        if table_row_counter is None:
+            table_row_counter = {'count': 0, 'in_table': False}
 
         # 检测是否使用 GPU
-        is_gpu = hasattr(model, 'device') and 'cuda' in str(model.device)
+        model_device = next(model.parameters()).device
+        is_gpu = 'cuda' in str(model_device)
+        print(f"[GPU INFO] 流式生成设备: {model_device} ({'GPU加速 ✓' if is_gpu else 'CPU模式 ⚠'})", file=sys.stderr)
 
         # 生成配置
         generation_kwargs = {
@@ -584,8 +616,10 @@ class QwenLocalLLM(OfflineLLM):
         generation_thread.start()
 
         full_text = ""
+        total_chars = 0
         timeout = 120  # 增加超时时间
         start_time = time.time()
+        last_log_time = start_time
 
         try:
             # 直接访问 text_queue
@@ -594,7 +628,7 @@ class QwenLocalLLM(OfflineLLM):
             # 根据设备调整轮询间隔
             poll_interval = 0.001 if is_gpu else 0.05
 
-            print(f"[DEBUG] 流式生成 - 设备: {'GPU' if is_gpu else 'CPU'}, 超时: {timeout}s")
+            print(f"[DEBUG] 流式生成开始 - 设备: {'GPU' if is_gpu else 'CPU'}, 超时: {timeout}s")
 
             # 使用非阻塞方式获取 tokens - 立即返回每个token
             while generation_thread.is_alive():
@@ -605,6 +639,88 @@ class QwenLocalLLM(OfflineLLM):
                         break
                     # 立即返回，不累积
                     full_text += text_chunk
+                    total_chars += len(text_chunk)
+
+                    # ========== 表格序号实时修正 ==========
+                    # 检测表格开始
+                    if not table_row_counter['in_table'] and ('| 序号 |' in text_chunk or '|序号|' in text_chunk):
+                        table_row_counter['in_table'] = True
+                        table_row_counter['count'] = 0
+                        print(f"[TABLE SEQ] ========== 检测到表格开始 ==========", file=sys.stderr)
+
+                    # 如果在表格中，修正序号
+                    if table_row_counter['in_table']:
+                        # 方案1：匹配完整的 sup 标签（最理想情况）
+                        def replace_sequence_number(match):
+                            table_row_counter['count'] += 1
+                            old_number = match.group(3)  # 标签内的数字
+                            filename = match.group(1)  # 文件名
+                            new_number = table_row_counter['count']
+                            print(f"[TABLE SEQ] ✓ 序号修正: {old_number} → {new_number}, 文件: {filename[:30]}...", file=sys.stderr)
+                            return f'<sup class="source-ref" data-filename="{filename}" data-ref="{new_number}">{new_number}</sup>'
+
+                        # 正则匹配表格数据行（完整sup标签）
+                        pattern = r'\| <sup[^>]*data-filename="([^"]*)"[^>]*data-ref="(\d+)"[^>]*>(\d+)</sup>'
+                        corrected_chunk = re.sub(pattern, replace_sequence_number, text_chunk)
+
+                        # 方案2：如果没有匹配到完整格式，尝试匹配不完整或被分割的sup标签
+                        if corrected_chunk == text_chunk:
+                            # 匹配：<sup ...>数字</sup> 格式（可能缺少data-filename）
+                            def replace_incomplete_sup(match):
+                                table_row_counter['count'] += 1
+                                old_number = match.group(2)
+                                new_number = table_row_counter['count']
+                                print(f"[TABLE SEQ] ✓ 不完整sup修正: {old_number} → {new_number}", file=sys.stderr)
+                                # 从同一行提取文件名（如果有）
+                                line_start = text_chunk.rfind('\n', 0, match.start())
+                                if line_start == -1:
+                                    line_start = 0
+                                line_end = text_chunk.find('\n', match.end())
+                                if line_end == -1:
+                                    line_end = len(text_chunk)
+                                line = text_chunk[line_start:line_end]
+                                # 尝试从该行提取文件名（第二列）
+                                parts = line.split('|')
+                                if len(parts) >= 3:
+                                    potential_filename = parts[2].strip() if len(parts) > 2 else ''
+                                    if potential_filename and potential_filename not in ['序号', '来源文件', '内容', '---']:
+                                        return f'| <sup class="source-ref" data-filename="{potential_filename}" data-ref="{new_number}">{new_number}</sup> |'
+                                return f'| <sup class="source-ref" data-ref="{new_number}">{new_number}</sup> |'
+
+                            # 匹配 <sup ...>数字</sup>
+                            corrected_chunk = re.sub(r'\| <sup[^>]*>(\d+)</sup>', replace_incomplete_sup, text_chunk)
+
+                        # 方案3：如果还是没有匹配，尝试纯数字格式
+                        if corrected_chunk == text_chunk:
+                            # | 2 | 文件名 | ... |
+                            def replace_simple_number(match):
+                                table_row_counter['count'] += 1
+                                old_number = match.group(1)
+                                new_number = table_row_counter['count']
+                                print(f"[TABLE SEQ] ✓ 纯数字序号修正: {old_number} → {new_number}", file=sys.stderr)
+                                return f'| <sup class="source-ref" data-ref="{new_number}">{new_number}</sup> |'
+
+                            # 只匹配第一列的数字（避免误匹配其他列）
+                            corrected_chunk = re.sub(r'^(\|\s*)(\d+)(\s*\|)', lambda m: f'{m.group(1)}<sup class="source-ref" data-ref="{table_row_counter["count"] + 1}">{table_row_counter["count"] + 1}</sup>{m.group(3)}', text_chunk, count=1)
+                            if corrected_chunk != text_chunk:
+                                table_row_counter['count'] += 1
+
+                        # 如果序号被修正，使用修正后的内容
+                        if corrected_chunk != text_chunk:
+                            text_chunk = corrected_chunk
+
+                    # 每秒输出一次速度统计
+                    current_time = time.time()
+                    if current_time - last_log_time >= 1.0:
+                        elapsed = current_time - start_time
+                        speed_chars = total_chars / elapsed if elapsed > 0 else 0
+                        # 估算token数（中文约2字符/token，英文约4字符/token）
+                        estimated_tokens = total_chars / 2.5
+                        speed_tokens = estimated_tokens / elapsed if elapsed > 0 else 0
+                        print(f"[GPU SPEED] 已生成 {total_chars} 字符 (约{estimated_tokens:.0f} tokens), "
+                              f"速度: {speed_chars:.1f} 字符/秒 ({speed_tokens:.1f} tokens/秒)", file=sys.stderr)
+                        last_log_time = current_time
+
                     yield text_chunk, False
 
                 except queue.Empty:
@@ -623,6 +739,49 @@ class QwenLocalLLM(OfflineLLM):
                     if text_chunk is None:
                         break
                     full_text += text_chunk
+                    total_chars += len(text_chunk)
+
+                    # ========== 表格序号实时修正（剩余数据，逻辑同上）==========
+                    if table_row_counter['in_table']:
+                        # 方案1：匹配完整的 sup 标签
+                        def replace_sequence_number(match):
+                            table_row_counter['count'] += 1
+                            old_number = match.group(3)
+                            filename = match.group(1)
+                            new_number = table_row_counter['count']
+                            print(f"[TABLE SEQ] ✓ 序号修正(剩余): {old_number} → {new_number}, 文件: {filename[:30]}...", file=sys.stderr)
+                            return f'<sup class="source-ref" data-filename="{filename}" data-ref="{new_number}">{new_number}</sup>'
+
+                        pattern = r'\| <sup[^>]*data-filename="([^"]*)"[^>]*data-ref="(\d+)"[^>]*>(\d+)</sup>'
+                        corrected_chunk = re.sub(pattern, replace_sequence_number, text_chunk)
+
+                        # 方案2：匹配不完整的sup标签
+                        if corrected_chunk == text_chunk:
+                            def replace_incomplete_sup(match):
+                                table_row_counter['count'] += 1
+                                old_number = match.group(1)
+                                new_number = table_row_counter['count']
+                                print(f"[TABLE SEQ] ✓ 不完整sup修正(剩余): {old_number} → {new_number}", file=sys.stderr)
+                                return f'| <sup class="source-ref" data-ref="{new_number}">{new_number}</sup> |'
+
+                            corrected_chunk = re.sub(r'\| <sup[^>]*>(\d+)</sup>', replace_incomplete_sup, text_chunk)
+
+                        # 方案3：纯数字格式
+                        if corrected_chunk == text_chunk:
+                            def replace_simple_number(match):
+                                table_row_counter['count'] += 1
+                                old_number = match.group(1)
+                                new_number = table_row_counter['count']
+                                print(f"[TABLE SEQ] ✓ 纯数字序号修正(剩余): {old_number} → {new_number}", file=sys.stderr)
+                                return f'| <sup class="source-ref" data-ref="{new_number}">{new_number}</sup> |'
+
+                            corrected_chunk = re.sub(r'^(\|\s*)(\d+)(\s*\|)', lambda m: f'{m.group(1)}<sup class="source-ref" data-ref="{table_row_counter["count"] + 1}">{table_row_counter["count"] + 1}</sup>{m.group(3)}', text_chunk, count=1)
+                            if corrected_chunk != text_chunk:
+                                table_row_counter['count'] += 1
+
+                        if corrected_chunk != text_chunk:
+                            text_chunk = corrected_chunk
+
                     yield text_chunk, False
             except queue.Empty:
                 pass
@@ -633,7 +792,20 @@ class QwenLocalLLM(OfflineLLM):
             traceback.print_exc()
         finally:
             generation_thread.join(timeout=5)
-            print(f"[DEBUG] 流式生成完成，full_text 长度: {len(full_text)}, 设备: {'GPU' if is_gpu else 'CPU'}")
+            total_time = time.time() - start_time
+            if total_time > 0:
+                speed_chars = total_chars / total_time
+                estimated_tokens = total_chars / 2.5
+                speed_tokens = estimated_tokens / total_time
+                print(f"[GPU INFO] 流式生成完成!", file=sys.stderr)
+                print(f"[GPU INFO] 总耗时: {total_time:.2f}秒", file=sys.stderr)
+                print(f"[GPU INFO] 生成内容: {total_chars} 字符 (约{estimated_tokens:.0f} tokens)", file=sys.stderr)
+                print(f"[GPU INFO] 平均速度: {speed_chars:.1f} 字符/秒 ({speed_tokens:.1f} tokens/秒)", file=sys.stderr)
+                if is_gpu:
+                    if speed_tokens < 20:
+                        print(f"[GPU WARNING] ⚠ GPU速度较慢 (<20 tokens/秒)，可能需要检查配置", file=sys.stderr)
+                    else:
+                        print(f"[GPU SUCCESS] ✓ GPU加速正常 (>{speed_tokens:.0f} tokens/秒)", file=sys.stderr)
             yield full_text, True
 
 
@@ -1082,7 +1254,7 @@ class RAGQA:
                     answer = re.sub(r'\[来源(\d+)\]', '', answer)
                     answer = re.sub(r'\[(\d+)\]', '', answer)
 
-            # 7. 添加来源列表（纯文本格式时）
+            # 7. 验证并修正表格（如果有表格）
             # 检测是否使用了表格格式（更精确的检测）
             has_table = False
             if '|' in answer:
@@ -1092,6 +1264,15 @@ class RAGQA:
                     if '| 来源文件 |' in answer or '|来源文件|' in answer:
                         has_table = True
 
+            # 如果是表格格式，验证并修正表格中的文件名和序号
+            if sources and has_table:
+                import time
+                validate_start = time.time()
+                answer = self._validate_table_filenames_only(answer, sources)
+                validate_time = (time.time() - validate_start) * 1000
+                print(f"[PERF] 表格验证和序号修正耗时: {validate_time:.1f}ms", file=sys.stderr)
+
+            # 8. 添加来源列表（纯文本格式时）
             # 如果不是表格格式且有来源文件，在答案最后添加来源列表
             if sources and not has_table:
                 # 构建来源列表，添加 <sup> 标签
@@ -1401,6 +1582,9 @@ class RAGQA:
             # 先检测是否会使用表格格式
             use_table_format = self._should_use_table_format(question)
 
+            # 导入 sys 用于调试输出
+            import sys
+
             full_answer = ""
             full_answer_processed = ""  # 保存处理后的完整答案
 
@@ -1414,11 +1598,9 @@ class RAGQA:
                     processed = self._process_buffer(_buffer, _sources_list if _has_sources else None, False)
 
                     if processed['output']:
-                        output_text = processed['output']
-                        full_answer_processed += output_text
-
-                        # 正常流式发送（不再检测重复，因为LLM已被指示每个文件只生成一行）
+                        # 直接发送（序号已在 _stream_generate 中修正）
                         yield {'type': 'content', 'data': processed['output']}
+                        full_answer_processed += processed['output']
 
                     _buffer = processed['remaining']
                     full_answer += text_chunk
@@ -1436,7 +1618,6 @@ class RAGQA:
                     break
 
             # 7. 流式输出结束
-            import sys
             generate_time = (time.time() - generate_start) * 1000
             print(f"[PERF] LLM生成耗时: {generate_time:.1f}ms, 生成字符数: {len(full_answer_processed)}", file=sys.stderr)
             print(f"[DEBUG] ========== 流式结束 ==========", file=sys.stderr)
@@ -1469,6 +1650,7 @@ class RAGQA:
                 final_answer = self._validate_table_filenames_only(final_answer, sources)
                 validate_time = (time.time() - validate_start) * 1000
                 print(f"[PERF] 文件名验证耗时: {validate_time:.1f}ms", file=sys.stderr)
+
 
             # 9. 添加来源列表（纯文本格式时）
             # 如果不是表格格式且有来源文件，在答案最后添加来源列表
@@ -1505,6 +1687,40 @@ class RAGQA:
                 yield {'type': 'done', 'data': {'sources': sources, 'full_answer': final_answer}}
             else:
                 yield {'type': 'done', 'data': {'full_answer': final_answer}}
+
+            # 如果是表格格式，发送完整修正后的表格（替换前端显示）
+            if has_table and final_answer:
+                # 提取完整的表格部分（从表头到表格结束）
+                import re
+                # 匹配表格：从 | 序号 | 开始，到最后一个 |...| 行
+                lines = final_answer.split('\n')
+                table_lines = []
+                in_table = False
+                table_start_idx = -1
+
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    # 检测表格开始（包含序号或来源文件列）
+                    if not in_table and ('| 序号 |' in stripped or '|序号|' in stripped):
+                        in_table = True
+                        table_start_idx = i
+                        table_lines.append(line)
+                        continue
+
+                    # 在表格中
+                    if in_table:
+                        # 检测表格结束（空行或非表格行）
+                        if not stripped or (not stripped.startswith('|') and not stripped.startswith('<')):
+                            break
+                        table_lines.append(line)
+
+                # 如果找到表格，提取并重新构建
+                if table_lines and len(table_lines) >= 3:  # 至少有表头、分隔符、一行数据
+                    corrected_table = '\n'.join(table_lines)
+
+                    # 发送替换事件，告诉前端用修正后的表格替换
+                    yield {'type': 'table_replace', 'data': corrected_table}
+                    print(f"[DEBUG] 已发送 table_replace 事件，包含修正后的表格（{len(table_lines)}行，序号已重新排序）", file=sys.stderr)
 
         except Exception as e:
             yield {'type': 'error', 'data': str(e)}
@@ -1740,12 +1956,10 @@ class RAGQA:
 
     def _validate_table_filenames_only(self, text: str, sources: list) -> str:
         """
-        只验证和修正表格中的文件名，不做合并
-
-        比 _validate_and_fix_table_filenames 更快，因为：
-        1. 不检测和合并重复文件（已在检索阶段合并）
-        2. 只验证文件名是否在白名单中
-        3. 只修正错误的文件名
+        处理表格：
+        1. 合并多个表格为一个
+        2. 验证和修正表格中的文件名
+        3. 重新排序序号列（确保序号连续）
 
         Args:
             text: 完整文本内容
@@ -1761,11 +1975,13 @@ class RAGQA:
         # 构建正确的文件名列表
         valid_filenames = {source['filename']: source for source in sources}
 
-        print(f"[DEBUG VALIDATE] 验证文件名，正确列表: {list(valid_filenames.keys())}", file=sys.stderr)
+        print(f"[DEBUG VALIDATE] 开始处理表格，正确文件名: {list(valid_filenames.keys())}", file=sys.stderr)
 
         lines = text.split('\n')
         result_lines = []
+        all_table_data_rows = []  # 收集所有表格的数据行（合并多个表格）
         in_table = False
+        table_header_found = False
 
         for line in lines:
             stripped_line = line.strip()
@@ -1774,56 +1990,138 @@ class RAGQA:
             if stripped_line.startswith('|') and stripped_line.endswith('|'):
                 if not in_table:
                     in_table = True
+                    table_header_found = False
+                    print(f"[DEBUG VALIDATE] 检测到表格开始", file=sys.stderr)
             elif in_table and not stripped_line:
                 in_table = False
-                result_lines.append(line)  # 保留空行
+                result_lines.append(line)
+                print(f"[DEBUG VALIDATE] 表格结束", file=sys.stderr)
                 continue
 
             # 处理表格行
             if in_table and stripped_line.startswith('|'):
-                # 检查是否是表头或分隔符行
-                if '来源文件' in stripped_line or '---' in stripped_line:
-                    result_lines.append(line)
+                # 跳过表头和分隔符行（只收集数据行）
+                if '来源文件' in stripped_line or '---' in stripped_line or '序号' in stripped_line:
+                    if not table_header_found and ('来源文件' in stripped_line or '序号' in stripped_line):
+                        table_header_found = True
+                        print(f"[DEBUG VALIDATE] 检测到表头: {stripped_line[:60]}", file=sys.stderr)
                     continue
 
-                # 使用正则表达式精确分割表格行
-                parts = re.split(r'\|', stripped_line)
-                parts = [p.strip() for p in parts if p is not None or len(parts) == 1]
+                # 尝试提取文件名（第二列）
+                # 使用更简单的分割逻辑
+                if '| 来源文件 |' in line or '|来源文件|' in line:
+                    # 这是表头，跳过
+                    continue
 
-                # 至少需要：| 序号 | 来源文件 | 内容 |
-                if len(parts) >= 3:
-                    # 第二列（索引1）应该是"来源文件"
-                    filename_cell = parts[1]
+                # 提取数据行：| 序号 | 文件名 | 内容 |
+                # 简单方法：找到第二个 | 和第三个 | 之间的内容
+                pipe_count = stripped_line.count('|')
+                if pipe_count >= 4:  # 至少有 | 序号 | 文件 | 内容 | (4个pipe)
+                    # 分割并提取列
+                    parts = [p.strip() for p in stripped_line.split('|')]
+                    # 去掉首尾的空元素
+                    parts = [p for p in parts if p]
 
-                    # 检查是否是表头行
-                    is_header_row = (filename_cell in ['序号', '来源文件', '内容', '---', '',
-                                   'No.', '编号', '文件', 'File', 'Source'])
-                    is_sup_cell = filename_cell.startswith('<sup')
-                    is_number_only = re.match(r'^[\d\s]+$', filename_cell)
+                    if len(parts) >= 3:
+                        # parts[0]=序号, parts[1]=文件名, parts[2]=内容
+                        sequence_cell = parts[0] if len(parts) > 0 else ''
+                        filename_cell = parts[1] if len(parts) > 1 else ''
 
-                    if not is_header_row and not is_sup_cell and not is_number_only:
-                        # 这是一个文件名列，需要验证
-                        if filename_cell not in valid_filenames:
-                            print(f"[DEBUG VALIDATE] ✗ 文件名无效: '{filename_cell}'", file=sys.stderr)
+                        print(f"[DEBUG VALIDATE] 提取列: 序号='{sequence_cell[:30]}', 文件='{filename_cell[:30]}'", file=sys.stderr)
 
-                            # 尝试精确匹配
-                            best_match = self._find_best_match_filename(filename_cell, valid_filenames.keys())
+                        # 检查是否是真正的数据行（文件名不在表头值中）
+                        header_values = ['序号', '来源文件', '内容', 'No.', '编号', 'File', 'Source', '---']
+                        is_data_row = filename_cell not in header_values and filename_cell
 
+                        if is_data_row:
+                            # 验证并修正文件名
+                            if filename_cell not in valid_filenames and filename_cell:
+                                best_match = self._find_best_match_filename(filename_cell, valid_filenames.keys())
+                                if best_match:
+                                    print(f"[DEBUG VALIDATE] 修正文件名: {filename_cell[:30]}... -> {best_match[:30]}...", file=sys.stderr)
+                                    # 替换文件名
+                                    line = line.replace(filename_cell, best_match)
+                                    # 同时替换序号列中的 data-filename
+                                    if f'data-filename="{filename_cell}"' in line:
+                                        line = line.replace(f'data-filename="{filename_cell}"', f'data-filename="{best_match}"')
+                                    elif f"data-filename='{filename_cell}'" in line:
+                                        line = line.replace(f"data-filename='{filename_cell}'", f"data-filename='{best_match}'")
+
+                            # 收集数据行
+                            all_table_data_rows.append(line)
+                            print(f"[DEBUG VALIDATE] ✓ 收集数据行 {len(all_table_data_rows)}: {stripped_line[:60]}", file=sys.stderr)
+                            continue
+
+                # 如果不是数据行，保留原行
+                result_lines.append(line)
+            else:
+                result_lines.append(line)
+
+        # 如果收集到了数据行，重新构建一个统一的表格
+        if all_table_data_rows:
+            print(f"[DEBUG VALIDATE] 共收集到 {len(all_table_data_rows)} 行数据，开始重新构建表格", file=sys.stderr)
+
+            # 添加表头
+            result_lines.append("| 序号 | 来源文件 | 内容 |")
+            result_lines.append("| --- | --- | --- |")
+
+            # 重新编号并添加数据行
+            for idx, data_row in enumerate(all_table_data_rows, 1):
+                # 首先提取该行对应的文件名（从第二列获取）
+                filename_in_row = None
+                parts = [p.strip() for p in data_row.split('|')]
+                parts = [p for p in parts if p]  # 去掉空元素
+                if len(parts) >= 2:
+                    # 尝试从第二列提取文件名
+                    potential_filename = parts[1]
+                    # 检查是否是有效的文件名（不是表头）
+                    header_values = ['序号', '来源文件', '内容', 'No.', '编号', 'File', 'Source']
+                    if potential_filename not in header_values:
+                        # 验证文件名
+                        if potential_filename in valid_filenames:
+                            filename_in_row = potential_filename
+                        else:
+                            # 尝试模糊匹配
+                            best_match = self._find_best_match_filename(potential_filename, valid_filenames.keys())
                             if best_match:
-                                print(f"[DEBUG VALIDATE] → 替换为: '{best_match}'", file=sys.stderr)
-                                parts[1] = best_match
-                                # 同时修正序号列中的 data-filename
-                                if len(parts) > 0 and '<sup' in parts[0]:
-                                    old_filename_pattern = re.escape(filename_cell)
-                                    parts[0] = re.sub(
-                                        rf'data-filename=["\']?{old_filename_pattern}["\']?',
-                                        f'data-filename="{best_match}"',
-                                        parts[0]
-                                    )
-                                # 重建行
-                                line = '|' + '|'.join(parts) + '|'
+                                filename_in_row = best_match
+                                # 同时替换文件名
+                                data_row = data_row.replace(potential_filename, best_match)
 
-            result_lines.append(line)
+                # 替换序号列
+                if filename_in_row:
+                    # 使用正确的文件名生成序号标签
+                    new_row = re.sub(
+                        r'^\|\s*<sup[^>]*data-filename="[^"]*"[^>]*data-ref=["\']?\d+["\']?[^>]*>\s*\d+\s*</sup>\s*\|',
+                        f'| <sup class="source-ref" data-filename="{filename_in_row}" data-ref="{idx}">{idx}</sup> |',
+                        data_row,
+                        count=1
+                    )
+                else:
+                    # 没有找到文件名，直接替换第一个|...|中的序号
+                    new_row = re.sub(
+                        r'^\|\s*<sup[^>]*>\s*\d+\s*</sup>\s*\|',
+                        f'| <sup class="source-ref" data-ref="{idx}">{idx}</sup> |',
+                        data_row,
+                        count=1
+                    )
+
+                # 如果没有 sup 标签，尝试替换纯数字序号（第一列）
+                if new_row == data_row:
+                    # 匹配 | 数字 | 格式（第一列）
+                    new_row = re.sub(
+                        r'^(\|\s*)(\d+)(\s*\|)',
+                        lambda m: f'{m.group(1)}<sup class="source-ref" data-ref="{idx}">{idx}</sup>{m.group(3)}',
+                        data_row,
+                        count=1
+                    )
+
+                result_lines.append(new_row)
+                print(f"[DEBUG VALIDATE] 重新编号第 {idx} 行，文件名: {filename_in_row if filename_in_row else '未找到'}", file=sys.stderr)
+
+            print(f"[DEBUG VALIDATE] 表格重建完成，共 {len(all_table_data_rows)} 行", file=sys.stderr)
+        else:
+            print(f"[DEBUG VALIDATE] 未检测到数据行", file=sys.stderr)
 
         result = '\n'.join(result_lines)
         return result
