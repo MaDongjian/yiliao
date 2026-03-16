@@ -1474,16 +1474,25 @@ class RAGQA:
             # 如果不是表格格式且有来源文件，在答案最后添加来源列表
             sources_list = ""
             if _has_sources and sources and not has_table:
+                # 先按文件名去重，避免来源列表中出现重复文件
+                seen_filenames = {}
+                unique_sources = []
+                for source in sources:
+                    filename = source['filename']
+                    if filename not in seen_filenames:
+                        seen_filenames[filename] = True
+                        unique_sources.append(source)
+
                 # 构建来源列表，添加 <sup> 标签
                 sources_list = "\n\n---\n\n**来源文件：**\n\n"
-                for idx, source in enumerate(sources, 1):
+                for idx, source in enumerate(unique_sources, 1):
                     filename = source['filename']
                     # 添加带属性的 sup 标签
                     sup_tag = f'<sup class="source-ref" data-filename="{filename}" data-ref="{idx}">{idx}</sup>'
                     # 使用 <br> 确保HTML渲染时换行
                     sources_list += f"{sup_tag}. {filename}<br>\n"
                 final_answer += sources_list
-                print(f"[DEBUG SOURCES] 已添加来源列表，来源数量：{len(sources)}", file=sys.stderr)
+                print(f"[DEBUG SOURCES] 已添加来源列表，原始数量：{len(sources)}，去重后：{len(unique_sources)}", file=sys.stderr)
                 print(f"[DEBUG SOURCES] 最终答案长度：{len(final_answer)}", file=sys.stderr)
 
                 # 额外发送来源列表作为 content 事件（确保前端能显示）
