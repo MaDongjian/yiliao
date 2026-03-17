@@ -31,6 +31,8 @@ from src.chunker import TextChunker
 from src.embedder import EmbeddingModel
 from src.attribute_extractor import AttributeExtractor, extract_attributes_from_file
 from src.text_summarizer import generate_summary
+from src.text_cleaner import TextCleaner
+from src.term_indexer import get_term_indexer
 import sqlalchemy as sa
 
 
@@ -154,7 +156,7 @@ def add_single_file(
     # 提取属性
     attributes = {}
     if extract_attributes:
-        print(f"\n[4/6] 提取文档属性...")
+        print(f"\n[4/8] 提取文档属性...")
         try:
             extractor = AttributeExtractor()
             attributes = extractor.extract(parsed['text'])
@@ -165,18 +167,47 @@ def add_single_file(
         except Exception as e:
             print(f"  属性提取失败: {e}")
 
-    # 分块
-    print(f"\n[5/6] 文本分块...")
+    # 条款级文本清洗
+    print(f"\n[5/8] 条款级文本清洗...")
+    try:
+        cleaner = TextCleaner()
+        cleaned_text, clean_stats = cleaner.clean(parsed['text'], attributes)
+        print(f"  清洗前: {clean_stats['original_length']} 字符")
+        print(f"  清洗后: {clean_stats['cleaned_length']} 字符")
+        print(f"  删除无效字符: {clean_stats['removed_chars']}")
+        print(f"  发现术语: {clean_stats['terms_found']} 个")
+        print(f"  发现条款: {clean_stats['clauses_found']} 个")
+        if clean_stats['standard_number']:
+            print(f"  标准号: {clean_stats['standard_number']}")
+    except Exception as e:
+        print(f"  文本清洗失败: {e}")
+        cleaned_text = parsed['text']  # 使用原始文本
+        clean_stats = {}
+
+    # 提取术语信息用于索引
+    print(f"\n[6/8] 提取术语信息...")
+    try:
+        terms_info = cleaner.extract_terms_for_indexing(cleaned_text, attributes)
+        print(f"  标准号: {terms_info.get('standard_number', '无')}")
+        print(f"  医疗术语: {len(terms_info.get('medical_terms', []))} 个")
+        print(f"  条款编号: {len(terms_info.get('clauses', []))} 个")
+        print(f"  同义词映射: {len(terms_info.get('synonyms', {}))} 组")
+    except Exception as e:
+        print(f"  术语提取失败: {e}")
+        terms_info = {}
+
+    # 分块（使用清洗后的文本）
+    print(f"\n[7/8] 文本分块...")
     chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = chunker.chunk(
-        text=parsed['text'],
+        text=cleaned_text,  # 使用清洗后的文本
         source_file=parsed['metadata']['filepath'],
         pages=parsed.get('pages')
     )
     print(f"  分块数量: {len(chunks)}")
 
     # 向量化
-    print(f"\n[6/6] 向量化...")
+    print(f"\n[8/8] 向量化...")
     embedder = EmbeddingModel(
         model_name="paraphrase-multilingual-MiniLM-L12-v2",
         cache_dir=Path(model_path).parent
@@ -185,6 +216,26 @@ def add_single_file(
     embeddings = embedder.encode_chunks(chunks, show_progress=True)
     print(f"  向量维度: {embeddings.shape[1]}")
     print(f"  向量数量: {embeddings.shape[0]}")
+
+    # 构建术语索引
+    if terms_info:
+        print(f"\n构建术语索引...")
+        try:
+            # 计算该文档的向量索引范围
+            start_vector_idx = len(chunks_metadata) if chunks_metadata else 0
+            vector_indices = list(range(start_vector_idx, start_vector_idx + len(chunks)))
+
+            term_indexer = get_term_indexer(str(output_dir))
+            term_indexer.add_document(
+                doc_id=current_doc_id,
+                terms_info=terms_info,
+                vector_indices=vector_indices
+            )
+            print(f"  术语索引已构建")
+        except Exception as e:
+            print(f"  术语索引构建失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     # 处理FAISS索引
     print(f"\n更新向量库...")
@@ -1467,6 +1518,7 @@ def upload_to_minio_server(
 
 
 if __name__ == "__main__":
-    upload_files_to_minio(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/file_info')
+    clear_vector_index()
+    batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/file_info')
 
 

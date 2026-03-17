@@ -1723,6 +1723,14 @@ class RAGQA:
             print(f"[DEBUG SOURCES] 最终答案包含 | : {'|' in final_answer}", file=sys.stderr)
             print(f"[DEBUG SOURCES] 最终答案包含 '来源文件': {'来源文件' in final_answer}", file=sys.stderr)
 
+            # 8.5 清理LLM生成的不需要的内容（段落格式和表格格式都需要清理）
+            if _has_sources and sources:
+                import time
+                clean_start = time.time()
+                final_answer = self._clean_llm_generated_content(final_answer)
+                clean_time = (time.time() - clean_start) * 1000
+                print(f"[PERF] 清理LLM生成内容耗时: {clean_time:.1f}ms", file=sys.stderr)
+
             # 表格格式：验证文件名（不合并，因为已在检索阶段合并）
             if _has_sources and sources and has_table:
                 import time
@@ -2205,6 +2213,80 @@ class RAGQA:
 
         result = '\n'.join(result_lines)
         return result
+
+    def _clean_llm_generated_content(self, text: str) -> str:
+        """
+        清理LLM生成的不需要的内容
+
+        清理内容：
+        1. [来源未列出，但为一般感冒处理原则] 类引用标记
+        2. "来源文件列表" 标题及其后面的"文件名："列表
+        3. 保留最后的"来源文件："或"来源："及编号列表
+
+        Args:
+            text: 完整文本内容
+
+        Returns:
+            清理后的文本
+        """
+        import re
+
+        # 步骤1：移除所有"来源未列出"类的引用标记
+        text = re.sub(r'\[来源未列出[^\]]*\]', '', text)
+        text = re.sub(r'\[来源[未：:][^\]]*\]', '', text)
+
+        # 步骤2：移除"来源文件列表"标题和其后的"文件名："列表
+        # 匹配模式：来源文件列表\n文件名：xxx.pdf\n文件名：yyy.pdf\n\n来源文件：
+        # 或者：来源文件列表\n文件名：xxx.pdf\n文件名：yyy.pdf\n来源文件：
+
+        # 先定位"来源文件列表"的位置
+        sources_list_pattern = r'来源文件列表\s*\n'
+        match = re.search(sources_list_pattern, text)
+
+        if match:
+            # 找到"来源文件列表"的起始位置
+            start_pos = match.start()
+
+            # 从这个位置开始，查找后面的内容
+            # 我们需要找到真正的"来源文件："或"来源："的位置
+            remaining_text = text[start_pos:]
+
+            # 查找真正的来源标题（带编号的）
+            # 匹配：\n\n来源文件：\n\n1. xxx.pdf 或 \n\n来源文件：\n\n<sup...>1</sup> xxx.pdf
+            real_sources_pattern = r'\n\n\*\*来源[文件]?[：:]\*\*\s*\n'
+            real_match = re.search(real_sources_pattern, remaining_text)
+
+            if real_match:
+                # 找到了真正的来源列表，删除中间的部分
+                real_start_pos = start_pos + real_match.start()
+                # 保留从"来源文件列表"之前到真正的来源列表之前的内容
+                # 删除从"来源文件列表"到真正来源列表之前的所有内容
+                text = text[:start_pos] + remaining_text[real_match.start():]
+                print(f"[DEBUG CLEAN] 已清理LLM生成的来源文件列表部分", file=sys.stderr)
+            else:
+                # 如果没找到真正的来源列表，删除"来源文件列表"及后面的所有内容
+                # 但要保留用户可能需要的其他信息
+                # 查找是否有连续的文件名列表（文件名：xxx.pdf\n文件名：yyy.pdf）
+                filename_list_pattern = r'(文件名：[^\n]+\n)+'
+                filename_match = re.search(filename_list_pattern, remaining_text)
+
+                if filename_match:
+                    # 只删除"来源文件列表"和文件名列表，保留后面的内容
+                    after_filename_list = remaining_text[filename_match.end():]
+                    # 检查后面是否有真正的来源列表
+                    if re.search(r'\n\n\*\*来源', after_filename_list):
+                        text = text[:start_pos] + after_filename_list
+                        print(f"[DEBUG CLEAN] 已清理来源文件列表和文件名列表", file=sys.stderr)
+                    else:
+                        # 没有真正的来源列表，删除"来源文件列表"开始的所有内容
+                        text = text[:start_pos]
+                        print(f"[DEBUG CLEAN] 已清理来源文件列表及后续所有内容", file=sys.stderr)
+                else:
+                    # 没有找到文件名列表，直接删除"来源文件列表"及后续内容
+                    text = text[:start_pos]
+                    print(f"[DEBUG CLEAN] 已清理来源文件列表标题", file=sys.stderr)
+
+        return text
 
     def _find_best_match_filename(self, invalid_name, valid_names, threshold=0.6):
         """找到最相似的文件名"""

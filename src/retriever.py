@@ -1,5 +1,6 @@
 """
 文档检索器 - 整合所有模块，提供统一的检索接口
+支持混合检索：向量语义检索 + 标准号/术语精确匹配
 """
 
 import os
@@ -13,11 +14,13 @@ try:
     from .chunker import TextChunker, TextChunk
     from .embedder import EmbeddingModel
     from .storage import VectorStore
+    from .term_indexer import get_term_indexer
 except ImportError:
     from parsers import DocumentParser, scan_documents
     from chunker import TextChunker, TextChunk
     from embedder import EmbeddingModel
     from storage import VectorStore
+    from term_indexer import get_term_indexer
 
 
 class DocumentRetriever:
@@ -212,7 +215,7 @@ class DocumentRetriever:
         Args:
             query: 查询文本
             top_k: 返回前K个结果
-            method: 搜索方法 ("semantic" 语义搜索, "keyword" 关键词搜索)
+            method: 搜索方法 ("semantic" 语义搜索, "keyword" 关键词搜索, "hybrid" 混合搜索)
             min_score: 最小相似度分数
 
         Returns:
@@ -224,6 +227,9 @@ class DocumentRetriever:
         if method == "keyword":
             # 关键词搜索
             results = self.storage.keyword_search(query, top_k=top_k)
+        elif method == "hybrid":
+            # 混合检索（语义 + 标准号/术语）
+            results = self.hybrid_search_with_terms(query, top_k=top_k)
         else:
             # 语义搜索
             query_embedding = self.embedder.encode(query)
@@ -235,6 +241,114 @@ class DocumentRetriever:
 
         return results
 
+    def hybrid_search_with_terms(
+        self,
+        query: str,
+        top_k: int = 5,
+        semantic_weight: float = 0.7,
+        term_weight: float = 0.2,
+        standard_weight: float = 0.1
+    ) -> List[Dict]:
+        """
+        混合检索（向量语义 + 标准号/术语精确匹配）
+
+        检索策略：
+        1. 向量语义检索（70%权重）
+        2. 标准号精确匹配（10%权重）
+        3. 医疗术语匹配（20%权重）
+
+        Args:
+            query: 查询文本
+            top_k: 返回前K个结果
+            semantic_weight: 语义检索权重
+            term_weight: 术语匹配权重
+            standard_weight: 标准号匹配权重
+
+        Returns:
+            搜索结果列表，按综合分数排序
+        """
+        if self.storage is None:
+            self.initialize()
+
+        # 1. 向量语义检索
+        query_embedding = self.embedder.encode(query)
+        semantic_results = self.storage.search(query_embedding, top_k=top_k * 3)
+
+        # 2. 构建结果字典（按文档分组）
+        doc_scores = {}  # {doc_id: {semantic: x, term: y, standard: z}}
+
+        for result in semantic_results:
+            doc_id = result.get('doc_id')
+            if doc_id is None:
+                doc_id = result.get('chunk_id', 0)  # 兼容
+
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = {
+                    'doc_id': doc_id,
+                    'semantic_score': 0.0,
+                    'term_score': 0.0,
+                    'standard_score': 0.0,
+                    'results': []
+                }
+
+            doc_scores[doc_id]['semantic_score'] = max(
+                doc_scores[doc_id]['semantic_score'],
+                result['score']
+            )
+            doc_scores[doc_id]['results'].append(result)
+
+        # 3. 术语提升
+        try:
+            term_indexer = get_term_indexer(self.index_dir)
+            boost_scores = term_indexer.query_boost_scores(
+                query,
+                list(doc_scores.keys())
+            )
+
+            # 应用术语提升分数
+            for doc_id, boost_score in boost_scores.items():
+                if doc_id in doc_scores:
+                    # 假设boost_score已经在0-1之间，分配给term和standard
+                    doc_scores[doc_id]['term_score'] = min(boost_score * 0.7, term_weight)
+                    doc_scores[doc_id]['standard_score'] = min(boost_score * 0.3, standard_weight)
+        except Exception as e:
+            # 如果术语索引失败，忽略术语提升
+            print(f"术语索引查询失败: {e}")
+            pass
+
+        # 4. 计算综合分数
+        for doc_id in doc_scores:
+            scores = doc_scores[doc_id]
+            # 归一化语义分数（假设在0-1之间）
+            semantic_normalized = min(scores['semantic_score'], 1.0)
+
+            # 综合分数 = 语义*0.7 + 术语*0.2 + 标准号*0.1
+            scores['combined_score'] = (
+                semantic_normalized * semantic_weight +
+                scores['term_score'] +
+                scores['standard_score']
+            )
+
+        # 5. 按综合分数排序
+        sorted_docs = sorted(
+            doc_scores.values(),
+            key=lambda x: x['combined_score'],
+            reverse=True
+        )
+
+        # 6. 提取top_k个结果
+        final_results = []
+        for doc_info in sorted_docs[:top_k]:
+            # 选择该文档中分数最高的结果
+            best_result = max(doc_info['results'], key=lambda x: x['score'])
+            best_result['score'] = doc_info['combined_score']
+            best_result['semantic_score'] = doc_info['semantic_score']
+            best_result['term_score'] = doc_info['term_score']
+            best_result['standard_score'] = doc_info['standard_score']
+            final_results.append(best_result)
+
+        return final_results
+
     def hybrid_search(
         self,
         query: str,
@@ -243,7 +357,7 @@ class DocumentRetriever:
         keyword_weight: float = 0.3
     ) -> List[Dict]:
         """
-        混合搜索（语义 + 关键词）
+        混合搜索（语义 + 关键词）- 保留向后兼容
 
         Args:
             query: 查询文本
