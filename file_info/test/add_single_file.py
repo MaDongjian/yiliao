@@ -40,8 +40,8 @@ def add_single_file(
     file_path: str,
     output_dir: str = "./data",
     model_path: str = "E:/answerInfo/yiliaozsk1/models/bge-large-zh-v1.5",
-    chunk_size: int = 512,
-    chunk_overlap: int = 50,
+    chunk_size: int = 300,
+    chunk_overlap: int = 30,
     save_txt: bool = True,
     txt_dir: str = "./txt",
     extract_attributes: bool = True,
@@ -463,14 +463,14 @@ def main():
     parser.add_argument(
         '--chunk-size',
         type=int,
-        default=512,
-        help='分块大小（默认512）'
+        default=300,
+        help='分块大小（默认300）'
     )
     parser.add_argument(
         '--chunk-overlap',
         type=int,
-        default=50,
-        help='分块重叠大小（默认50）'
+        default=30,
+        help='分块重叠大小（默认30）'
     )
     parser.add_argument(
         '--txt-dir',
@@ -704,8 +704,8 @@ def batch_add_files(
     source_dir: str = None,
     output_dir: str = "./data",
     model_path: str = "E:/answerInfo/yiliaozsk1/models/bge-large-zh-v1.5",
-    chunk_size: int = 512,
-    chunk_overlap: int = 50,
+    chunk_size: int = 300,
+    chunk_overlap: int = 30,
     save_txt: bool = True,
     txt_dir: str = "./txt",
     extract_attributes: bool = True,
@@ -1524,16 +1524,8 @@ import faiss
 
 if __name__ == "__main__":
     #clear_vector_index()
-    #batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/file_info', use_gpu=True)
-    index = faiss.read_index("E:/answerInfo/yiliaozsk1/file_info/test/data/faiss.index")
+    batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/标准', use_gpu=True)
 
-    # 查看向量维度
-    dimension = index.d
-    print(f"向量维度: {dimension}")
-
-    # 查看向量数量
-    num_vectors = index.ntotal
-    print(f"向量数量: {num_vectors}")
 
 
 

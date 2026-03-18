@@ -3,7 +3,7 @@
 """
 
 import re
-from typing import List, Dict, Optional, TYPE_CHECKING
+from typing import List, Dict, Optional, TYPE_CHECKING, Tuple
 from dataclasses import dataclass
 
 # 避免循环导入
@@ -19,28 +19,48 @@ class TextChunk:
     source_file: str
     page_number: Optional[int] = None
     metadata: Optional[Dict] = None
+    chapter: Optional[str] = None  # 新增：所属章节
 
 
 class TextChunker:
-    """文本分块器"""
+    """文本分块器 - 支持章节语义分块"""
 
     def __init__(
         self,
-        chunk_size: int = 512,
-        chunk_overlap: int = 50,
+        chunk_size: int = 300,
+        chunk_overlap: int = 30,
         separator: str = "\n\n"
     ):
         """
         初始化分块器
 
         Args:
-            chunk_size: 每块的最大字符数
-            chunk_overlap: 块之间的重叠字符数
+            chunk_size: 每块的最大字符数（默认300）
+            chunk_overlap: 块之间的重叠字符数（默认30，约10%）
             separator: 分隔符
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.separator = separator
+
+        # 章节识别模式（按优先级排序）
+        self.chapter_patterns = [
+            # 中文数字章节
+            (r'^(第[一二三四五六七八九十百千]+章)[\s\.:：]*(.+)?$', 'chapter'),
+            (r'^(第[一二三四五六七八九十百千]+节)[\s\.:：]*(.+)?$', 'section'),
+            (r'^(第[一二三四五六七八九十百千]+篇)[\s\.:：]*(.+)?$', 'part'),
+            # 阿拉伯数字章节
+            (r'^(\d+[\.\s]+章)[\s\.:：]*(.+)?$', 'chapter_num'),
+            (r'^(\d+[\.\s]+节)[\s\.:：]*(.+)?$', 'section_num'),
+            # 附录
+            (r'^(附录[ABCDEFabcdf])[\.、\s]*(.+)?$', 'appendix'),
+            (r'^(附録[ABCDEFabcdf])[\.、\s]*(.+)?$', 'appendix'),
+            (r'^(附件[一二三四五六七八九十ABCDEF])[\.、\s]*(.+)?$', 'attachment'),
+            # 其他常见标题模式
+            (r'^(\d+\s+\S.+)$', 'numbered_title'),  # "1 标题"
+            (r'^([一二三四五六七八九十][、.]\s*.+)$', 'cn_num_title'),  # "一、标题"
+            (r'^([（(]\d+[)）]\s*.+)$', 'paren_num_title'),  # "(1) 标题"
+        ]
 
     def chunk(
         self,
@@ -49,7 +69,7 @@ class TextChunker:
         pages: Optional[List[str]] = None
     ) -> List[TextChunk]:
         """
-        将文本分割成块
+        将文本分割成块（优先按章节分块）
 
         Args:
             text: 完整文本
@@ -62,7 +82,7 @@ class TextChunker:
         if pages:
             return self._chunk_by_pages(text, pages, source_file)
         else:
-            return self._chunk_by_size(text, source_file)
+            return self._chunk_by_chapter(text, source_file)
 
     def _chunk_by_pages(
         self,
@@ -70,13 +90,19 @@ class TextChunker:
         pages: List[str],
         source_file: str
     ) -> List[TextChunk]:
-        """按页/段落分块"""
+        """按页/段落分块（增强版：包含章节信息）"""
         chunks = []
         chunk_id = 0
+        current_chapter = None  # 当前章节
 
         for page_num, page_text in enumerate(pages, 1):
             if not page_text.strip():
                 continue
+
+            # 检测页面上是否有章节标题
+            detected_chapter = self._detect_chapter(page_text)
+            if detected_chapter:
+                current_chapter = detected_chapter
 
             # 如果单页过长，进一步分割
             if len(page_text) > self.chunk_size:
@@ -87,7 +113,12 @@ class TextChunker:
                         chunk_id=chunk_id,
                         source_file=source_file,
                         page_number=page_num,
-                        metadata={"sub_chunk": i, "total_sub_chunks": len(sub_chunks)}
+                        chapter=current_chapter,
+                        metadata={
+                            "sub_chunk": i,
+                            "total_sub_chunks": len(sub_chunks),
+                            "chapter": current_chapter
+                        }
                     ))
                     chunk_id += 1
             else:
@@ -95,29 +126,126 @@ class TextChunker:
                     text=page_text,
                     chunk_id=chunk_id,
                     source_file=source_file,
-                    page_number=page_num
+                    page_number=page_num,
+                    chapter=current_chapter,
+                    metadata={"chapter": current_chapter}
                 ))
                 chunk_id += 1
 
         return chunks
 
-    def _chunk_by_size(self, text: str, source_file: str) -> List[TextChunk]:
-        """按固定大小分块"""
+    def _chunk_by_chapter(self, text: str, source_file: str) -> List[TextChunk]:
+        """按章节语义分块（优先在章节边界分割）"""
+        # 1. 将文本按章节分割
+        chapter_sections = self._split_by_chapters(text)
+
         chunks = []
         chunk_id = 0
 
-        sub_chunks = self._split_text(text)
-
-        for i, chunk_text in enumerate(sub_chunks):
-            chunks.append(TextChunk(
-                text=chunk_text,
-                chunk_id=chunk_id,
-                source_file=source_file,
-                metadata={"sub_chunk": i, "total_sub_chunks": len(sub_chunks)}
-            ))
-            chunk_id += 1
+        # 2. 对每个章节进行分块
+        for chapter_title, chapter_text in chapter_sections:
+            # 如果章节内容过长，需要进一步分割
+            if len(chapter_text) <= self.chunk_size:
+                # 整个章节作为一个chunk
+                chunks.append(TextChunk(
+                    text=chapter_text,
+                    chunk_id=chunk_id,
+                    source_file=source_file,
+                    chapter=chapter_title,
+                    metadata={"chapter": chapter_title}
+                ))
+                chunk_id += 1
+            else:
+                # 章节过长，需要分割
+                sub_chunks = self._split_text(chapter_text)
+                for i, sub_chunk in enumerate(sub_chunks):
+                    chunks.append(TextChunk(
+                        text=sub_chunk,
+                        chunk_id=chunk_id,
+                        source_file=source_file,
+                        chapter=chapter_title,
+                        metadata={
+                            "chapter": chapter_title,
+                            "sub_chunk": i,
+                            "total_sub_chunks": len(sub_chunks),
+                            "is_last_sub_chunk": (i == len(sub_chunks) - 1)
+                        }
+                    ))
+                    chunk_id += 1
 
         return chunks
+
+    def _detect_chapter(self, text: str) -> Optional[str]:
+        """
+        检测文本开头的章节标题
+
+        Args:
+            text: 文本内容
+
+        Returns:
+            章节标题，如果未检测到返回None
+        """
+        # 只检查前几行（通常标题在开头）
+        lines = text.split('\n')[:5]
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            for pattern, _ in self.chapter_patterns:
+                match = re.match(pattern, line, re.MULTILINE)
+                if match:
+                    # 返回完整的章节标题
+                    return line
+
+        return None
+
+    def _split_by_chapters(self, text: str) -> List[Tuple[str, str]]:
+        """
+        按章节分割文本
+
+        Args:
+            text: 完整文本
+
+        Returns:
+            [(章节标题, 章节内容), ...] 列表
+        """
+        sections = []
+        lines = text.split('\n')
+
+        current_chapter = "前言/概述"  # 默认章节
+        current_content = []
+
+        for line in lines:
+            stripped_line = line.strip()
+            is_chapter_header = False
+
+            # 检查是否是章节标题
+            for pattern, _ in self.chapter_patterns:
+                if re.match(pattern, stripped_line, re.MULTILINE):
+                    # 保存上一个章节
+                    if current_content:
+                        content = '\n'.join(current_content).strip()
+                        if content:
+                            sections.append((current_chapter, content))
+
+                    # 开始新章节
+                    current_chapter = stripped_line
+                    current_content = []
+                    is_chapter_header = True
+                    break
+
+            if not is_chapter_header:
+                current_content.append(line)
+
+        # 保存最后一个章节
+        if current_content:
+            content = '\n'.join(current_content).strip()
+            if content:
+                sections.append((current_chapter, content))
+
+        return sections
 
     def _split_text(self, text: str) -> List[str]:
         """

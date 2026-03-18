@@ -117,7 +117,7 @@ class OllamaLLM(OfflineLLM):
                 ['ollama', 'run', self.model_name, full_prompt],
                 capture_output=True,
                 text=True,
-                timeout=120000  # 2分钟超时
+                timeout=300000  # 5分钟超时（增加）
             )
 
             return result.stdout.strip()
@@ -173,7 +173,7 @@ class OllamaLLM(OfflineLLM):
                     ['ollama', 'run', self.model_name, full_prompt],
                     capture_output=True,
                     text=True,
-                    timeout=120000
+                    timeout=300000  # 5分钟超时
                 )
                 return result.stdout.strip()
             except subprocess.TimeoutExpired:
@@ -215,7 +215,7 @@ class OllamaLLM(OfflineLLM):
 
         try:
             # 发送流式请求
-            response = requests.post(url, json=data, stream=True, timeout=120)
+            response = requests.post(url, json=data, stream=True, timeout=300)  # 5分钟超时
             response.raise_for_status()
 
             # 逐行读取响应
@@ -760,7 +760,7 @@ class QwenLocalLLM(OfflineLLM):
 
         full_text = ""
         total_chars = 0
-        timeout = 120  # 增加超时时间
+        timeout = 300  # 5分钟超时（增加）
         start_time = time.time()
         last_log_time = start_time
 
