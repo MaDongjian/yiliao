@@ -28,7 +28,7 @@ class DocumentRetriever:
 
     def __init__(
         self,
-        model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+        model_name: str = "bge-large-zh-v1.5",
         index_dir: str = "./data/index",
         chunk_size: int = 512,
         chunk_overlap: int = 50
@@ -37,7 +37,7 @@ class DocumentRetriever:
         初始化文档检索系统
 
         Args:
-            model_name: 向量化模型名称
+            model_name: 向量化模型名称（默认 bge-large-zh-v1.5）
             index_dir: 索引目录
             chunk_size: 分块大小
             chunk_overlap: 分块重叠

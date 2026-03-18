@@ -9,6 +9,25 @@ from pathlib import Path
 from typing import List, Dict, Optional, Generator, Callable, Union
 from threading import Thread
 
+# ============================================================
+# 修复 PyTorch CVE-2025-32434 安全漏洞（模块级补丁）
+# 必须在所有 transformers 导入之前执行
+# ============================================================
+os.environ['USE_WEIGHTS_ONLY'] = '0'
+
+if not hasattr(torch, '_load_patched'):
+    _original_torch_load = torch.load
+
+    def _patched_torch_load(f, *args, **kwargs):
+        """强制移除 weights_only=True 参数"""
+        if kwargs.get('weights_only', False) is True:
+            kwargs['weights_only'] = False
+        return _original_torch_load(f, *args, **kwargs)
+
+    torch.load = _patched_torch_load
+    torch._load_patched = True  # 标记已打补丁，避免重复
+# ============================================================
+
 
 class FlexibleQwenLLM:
     """

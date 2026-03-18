@@ -39,14 +39,15 @@ import sqlalchemy as sa
 def add_single_file(
     file_path: str,
     output_dir: str = "./data",
-    model_path: str = "E:/answerInfo/yiliaozsk1/models/paraphrase-multilingual-MiniLM-L12-v2",
+    model_path: str = "E:/answerInfo/yiliaozsk1/models/bge-large-zh-v1.5",
     chunk_size: int = 512,
     chunk_overlap: int = 50,
     save_txt: bool = True,
     txt_dir: str = "./txt",
     extract_attributes: bool = True,
     generate_summary_flag: bool = True,
-    save_to_db: bool = True
+    save_to_db: bool = True,
+    use_gpu: bool = True
 ):
     """
     添加单个文件到向量库（支持 PDF/Word/PPT）
@@ -62,6 +63,7 @@ def add_single_file(
         extract_attributes: 是否提取文档属性（默认True）
         generate_summary_flag: 是否生成文本概要（默认True）
         save_to_db: 是否保存到数据库（默认True）
+        use_gpu: 是否使用GPU加速向量化（默认True）
 
     Returns:
         dict: 处理结果统计信息
@@ -208,9 +210,13 @@ def add_single_file(
 
     # 向量化
     print(f"\n[8/8] 向量化...")
+    device = 'cuda' if use_gpu else None
+    if use_gpu:
+        print(f"  使用GPU加速")
     embedder = EmbeddingModel(
-        model_name="paraphrase-multilingual-MiniLM-L12-v2",
-        cache_dir=Path(model_path).parent
+        model_name="bge-large-zh-v1.5",
+        cache_dir=Path(model_path).parent,
+        device=device
     )
     embedder.load()
     embeddings = embedder.encode_chunks(chunks, show_progress=True)
@@ -325,28 +331,15 @@ def add_single_file(
             db.init_app(temp_app)
 
             with temp_app.app_context():
-                # 检查是否已存在相同文件的记录
+                # 只根据文件名查询数据库中是否已存在
                 existing_record = DocumentAttribute.query.filter_by(
-                    filename=file_path.name,
-                    filepath=str(file_path)
+                    filename=file_path.name
                 ).first()
 
                 if existing_record:
-                    # 更新已存在的记录
-                    existing_record.summary = summary
-                    existing_record.attributes = attributes_for_db
-                    existing_record.attributes_count = len(attributes)
-                    existing_record.text_length = len(parsed['text'])
-                    existing_record.chunks_count = len(chunks)
-                    existing_record.total_vectors = int(index.ntotal)
-                    existing_record.vector_dimension = int(embeddings.shape[1])
-                    existing_record.txt_file = str(txt_filepath) if save_txt else None
-                    existing_record.status = 'success'
-                    existing_record.updated_at = sa.func.now()
-
-                    db.session.commit()
+                    # 文件名已存在，跳过数据库新增和更新
                     db_record_id = existing_record.id
-                    print(f"  数据库记录已更新: ID={db_record_id}")
+                    print(f"  数据库中已存在同名文件，跳过新增: ID={db_record_id}")
                 else:
                     # 创建新记录
                     db_record = DocumentAttribute(
@@ -464,7 +457,7 @@ def main():
         '--model',
         '-m',
         type=str,
-        default='E:/answerInfo/yiliaozsk1/models/paraphrase-multilingual-MiniLM-L12-v2',
+        default='E:/answerInfo/yiliaozsk1/models/bge-large-zh-v1.5',
         help='向量化模型路径'
     )
     parser.add_argument(
@@ -523,6 +516,11 @@ def main():
         default=None,
         help='上传到MinIO的日期（格式：YYYY-MM-DD，默认为今天）'
     )
+    parser.add_argument(
+        '--no-gpu',
+        action='store_true',
+        help='不使用GPU加速向量化（使用CPU）'
+    )
 
     args = parser.parse_args()
 
@@ -557,7 +555,8 @@ def main():
             extract_attributes=not args.no_attributes,
             generate_summary_flag=not args.no_summary,
             save_to_db=not args.no_db,
-            skip_existing=not args.force
+            skip_existing=not args.force,
+            use_gpu=not args.no_gpu
         )
         print(f"\nResult: {json.dumps(result, ensure_ascii=False, indent=2)}")
         return
@@ -577,7 +576,8 @@ def main():
         txt_dir=args.txt_dir,
         extract_attributes=not args.no_attributes,
         generate_summary_flag=not args.no_summary,
-        save_to_db=not args.no_db
+        save_to_db=not args.no_db,
+        use_gpu=not args.no_gpu
     )
 
     # 打印结果JSON（便于程序调用）
@@ -703,7 +703,7 @@ def clear_vector_index(
 def batch_add_files(
     source_dir: str = None,
     output_dir: str = "./data",
-    model_path: str = "E:/answerInfo/yiliaozsk1/models/paraphrase-multilingual-MiniLM-L12-v2",
+    model_path: str = "E:/answerInfo/yiliaozsk1/models/bge-large-zh-v1.5",
     chunk_size: int = 512,
     chunk_overlap: int = 50,
     save_txt: bool = True,
@@ -711,7 +711,8 @@ def batch_add_files(
     extract_attributes: bool = True,
     generate_summary_flag: bool = True,
     save_to_db: bool = True,
-    skip_existing: bool = True
+    skip_existing: bool = True,
+    use_gpu: bool = True
 ):
     """
     批量处理目录下的所有文件，向量化并保存到数据库
@@ -728,6 +729,7 @@ def batch_add_files(
         generate_summary_flag: 是否生成文本概要（默认True）
         save_to_db: 是否保存到数据库（默认True）
         skip_existing: 是否跳过已索引的文件（默认True）
+        use_gpu: 是否使用GPU加速向量化（默认True）
 
     Returns:
         dict: 批量处理结果统计
@@ -831,7 +833,8 @@ def batch_add_files(
                 txt_dir=txt_dir,
                 extract_attributes=extract_attributes,
                 generate_summary_flag=generate_summary_flag,
-                save_to_db=save_to_db
+                save_to_db=save_to_db,
+                use_gpu=use_gpu
             )
 
             if result['status'] == 'success':
@@ -1516,9 +1519,21 @@ def upload_to_minio_server(
 
     return result
 
+import faiss
+
 
 if __name__ == "__main__":
-    clear_vector_index()
-    batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/file_info')
+    #clear_vector_index()
+    #batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/file_info', use_gpu=True)
+    index = faiss.read_index("E:/answerInfo/yiliaozsk1/file_info/test/data/faiss.index")
+
+    # 查看向量维度
+    dimension = index.d
+    print(f"向量维度: {dimension}")
+
+    # 查看向量数量
+    num_vectors = index.ntotal
+    print(f"向量数量: {num_vectors}")
+
 
 

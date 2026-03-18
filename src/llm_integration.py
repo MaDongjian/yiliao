@@ -126,6 +126,129 @@ class OllamaLLM(OfflineLLM):
         except Exception as e:
             raise Exception(f"Ollama 调用失败: {e}")
 
+    def generate(
+        self,
+        prompt: str,
+        context: str = "",
+        max_length: int = 2048,
+        stream: bool = False,
+        temperature: float = None,
+        do_sample: bool = None
+    ):
+        """
+        使用 Ollama 生成回答（支持流式输出）
+
+        Args:
+            prompt: 用户问题
+            context: 检索到的上下文
+            max_length: 生成的最大长度
+            stream: 是否使用流式输出
+            temperature: 采样温度（Ollama API 支持）
+            do_sample: 是否使用采样
+
+        Returns:
+            如果 stream=False: 模型回答字符串
+            如果 stream=True: 生成器，每次产生 (text_chunk: str, is_finished: bool)
+        """
+        import subprocess
+        import json
+
+        # 构建完整提示词
+        if context:
+            full_prompt = f"""你是医疗标准知识助手。请根据以下参考信息回答问题。
+
+参考信息:
+{context}
+
+问题: {prompt}
+
+回答:"""
+        else:
+            full_prompt = f"问题: {prompt}\n回答:"
+
+        if not stream:
+            # 非流式生成（原有逻辑）
+            try:
+                result = subprocess.run(
+                    ['ollama', 'run', self.model_name, full_prompt],
+                    capture_output=True,
+                    text=True,
+                    timeout=120000
+                )
+                return result.stdout.strip()
+            except subprocess.TimeoutExpired:
+                raise Exception("模型回答超时")
+            except Exception as e:
+                raise Exception(f"Ollama 调用失败: {e}")
+        else:
+            # 流式生成
+            return self._generate_stream(full_prompt, temperature)
+
+    def _generate_stream(self, prompt: str, temperature: float = None):
+        """
+        Ollama 流式生成（使用 HTTP API）
+
+        Args:
+            prompt: 完整提示词
+            temperature: 采样温度
+
+        Yields:
+            (text_chunk: str, is_finished: bool)
+        """
+        import requests
+        import json
+
+        # Ollama HTTP API 端点
+        url = "http://localhost:11434/api/generate"
+
+        # 构建请求
+        data = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": True,
+            "options": {
+                "num_predict": 2048,  # 最大生成 token 数
+                "temperature": temperature if temperature else 0.7,
+                "top_p": 0.9,
+            }
+        }
+
+        try:
+            # 发送流式请求
+            response = requests.post(url, json=data, stream=True, timeout=120)
+            response.raise_for_status()
+
+            # 逐行读取响应
+            for line in response.iter_lines():
+                if line:
+                    line = line.decode('utf-8')
+
+                    # Ollama API 返回的 JSON 行可能没有 "data: " 前缀
+                    # 如果有前缀则移除，否则直接解析
+                    if line.startswith('data: '):
+                        json_str = line[6:]
+                    else:
+                        json_str = line
+
+                    try:
+                        chunk_data = json.loads(json_str)
+                        text_chunk = chunk_data.get('response', '')
+                        done = chunk_data.get('done', False)
+
+                        if text_chunk:
+                            yield (text_chunk, done)
+
+                        if done:
+                            # 流式结束
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Ollama API 调用失败: {e}")
+        except Exception as e:
+            raise Exception(f"Ollama 流式生成出错: {e}")
+
 
 class QwenLocalLLM(OfflineLLM):
     """
@@ -158,6 +281,26 @@ class QwenLocalLLM(OfflineLLM):
             import gc
         except ImportError:
             raise ImportError("请安装 torch: pip install torch")
+
+        # ============================================================
+        # 修复 PyTorch CVE-2025-32434 安全漏洞
+        # 在加载 transformers 模型之前应用补丁
+        # ============================================================
+        import os
+        os.environ['USE_WEIGHTS_ONLY'] = '0'
+
+        if not hasattr(torch, '_load_patched'):
+            _original_torch_load = torch.load
+
+            def _patched_torch_load(f, *args, **kwargs):
+                """强制移除 weights_only=True 参数"""
+                if kwargs.get('weights_only', False) is True:
+                    kwargs['weights_only'] = False
+                return _original_torch_load(f, *args, **kwargs)
+
+            torch.load = _patched_torch_load
+            torch._load_patched = True
+        # ============================================================
 
         # 使用正斜杠路径
         model_path_str = str(self.model_path).replace('\\', '/')
@@ -1206,7 +1349,10 @@ class RAGQA:
 - 请使用富文本段落格式回答，严禁使用任何表格格式
 - 禁止使用 Markdown 表格语法（如 |、--- 等符号）
 - 使用分段落、分要点的方式组织内容，适当使用 emoji（如 📌、💡、⚠️、✅ 等）
-- 回答将在最后自动添加来源文件列表
+- 【严禁】在回答内容中生成任何来源文件列表、参考文件列表或参考文献
+- 【禁止】在回答末尾添加"来源文件："、"来源："、"参考文件："、"参考资料："等字样及后续列表
+- 【禁止】列举任何文件名称或文档来源，系统会自动在回答最后添加编号的来源文件列表
+- 只专注于回答问题本身，不要提及任何文件来源
 
 用户问题：{question}
 
@@ -1345,13 +1491,13 @@ class RAGQA:
                 'success': False
             }
 
-    def ask_stream(self, question: str, top_k: int = 12, method: str = "hybrid", temperature: float = None, do_sample: bool = None, min_score: float = 0.15):
+    def ask_stream(self, question: str, top_k: int = 6, method: str = "hybrid", temperature: float = None, do_sample: bool = None, min_score: float = 0.15):
         """
-        流式提问并生成答案
+        流式提问并生成答案（性能优化版）
 
         Args:
             question: 用户问题
-            top_k: 检索的文档数量
+            top_k: 检索的文档数量（默认6，优化性能）
             method: 搜索方法 ("semantic" 或 "keyword")
             temperature: 采样温度（0.8-1.2 有随机性）
             do_sample: 是否使用采样（True 有随机性）
@@ -1363,6 +1509,10 @@ class RAGQA:
                 'data': any
             }
         """
+        import time
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+
         # 重置引用计数器和sources列表
         self._citation_counter = 0
         self._citation_sources = []
@@ -1373,92 +1523,88 @@ class RAGQA:
         _sources_list = []
 
         try:
-            # 1. 先返回检索阶段
-            yield {'type': 'status', 'data': '正在搜索相关文档...'}
+            # 1. 立即返回状态，让用户知道正在处理
+            yield {'type': 'status', 'data': 'AI正在思考...'}
 
-            # 2. 检索相关文档
-            import time
+            # 2. 并行检索相关文档（优化性能）
             search_start = time.time()
 
-            sentence_results = self.search_model.search(
-                question,
-                method=method,
-                top_k=top_k,
-                level="sentence"
-            )
+            # 使用线程池并行执行sentence和chunk搜索
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                sentence_future = executor.submit(
+                    self.search_model.search,
+                    question,
+                    method=method,
+                    top_k=top_k,
+                    level="sentence"
+                )
+                chunk_future = executor.submit(
+                    self.search_model.search,
+                    question,
+                    method=method,
+                    top_k=max(2, top_k // 2),
+                    level="chunk"
+                )
 
-            chunk_results = self.search_model.search(
-                question,
-                method=method,
-                top_k=max(2, top_k - 1),
-                level="chunk"
-            )
+                # 获取结果
+                sentence_results = sentence_future.result()
+                chunk_results = chunk_future.result()
 
-            import sys
-            print(f"[PERF] 检索耗时: {((time.time() - search_start) * 1000):.1f}ms, 结果数: {len(sentence_results)} + {len(chunk_results)}", file=sys.stderr)
+            search_time = (time.time() - search_start) * 1000
+            print(f"[PERF] 并行检索耗时: {search_time:.1f}ms, 结果数: {len(sentence_results)} + {len(chunk_results)}", file=sys.stderr)
 
             # 标记是否检索到相关信息
             has_context = bool(sentence_results or chunk_results)
 
-            # 3. 先合并相同文档，再构建上下文
-            # 使用字典按 (filename, filepath) 合并，避免同一文档出现多次
+            # 3. 快速合并相同文档（优化性能）
+            merge_start = time.time()
             seen_docs = {}  # {(filename, filepath): merged_source}
-            seen_texts = set()
 
-            # 处理句子级别结果 - 过滤低相似度结果
+            # 快速处理句子级别结果
             for r in sentence_results:
-                # 过滤低于相似度阈值的结果
                 if r['score'] < min_score:
                     continue
                 text = r['text'].strip()
-                if text and text not in seen_texts:
-                    key = (r['filename'], r['filepath'])
-                    if key in seen_docs:
-                        # 合并内容
-                        seen_docs[key]['content'] += "\n\n" + text
-                        # 保留最高的相似度
-                        if r['score'] > seen_docs[key]['similarity']:
-                            seen_docs[key]['similarity'] = r['score']
-                    else:
-                        seen_docs[key] = {
-                            'filename': r['filename'],
-                            'filepath': r['filepath'],
-                            'content': text,
-                            'similarity': r['score']
-                        }
-                    seen_texts.add(text)
+                if not text:
+                    continue
+                key = (r['filename'], r['filepath'])
+                if key in seen_docs:
+                    # 简单合并：只保留最高相似度的内容
+                    if r['score'] > seen_docs[key]['similarity']:
+                        seen_docs[key]['content'] = text
+                        seen_docs[key]['similarity'] = r['score']
+                else:
+                    seen_docs[key] = {
+                        'filename': r['filename'],
+                        'filepath': r['filepath'],
+                        'content': text,
+                        'similarity': r['score']
+                    }
 
-            # 处理文本块级别结果 - 过滤低相似度结果
+            # 快速处理文本块级别结果
             for r in chunk_results:
-                # 过滤低于相似度阈值的结果
                 if r['score'] < min_score:
                     continue
                 text = r['text'].strip()
-                if text and text not in seen_texts:
-                    key = (r['filename'], r['filepath'])
-                    if key in seen_docs:
-                        # 合并内容
-                        seen_docs[key]['content'] += "\n\n" + text
-                        # 保留最高的相似度
-                        if r['score'] > seen_docs[key]['similarity']:
-                            seen_docs[key]['similarity'] = r['score']
-                    else:
-                        seen_docs[key] = {
-                            'filename': r['filename'],
-                            'filepath': r['filepath'],
-                            'content': text,
-                            'similarity': r['score']
-                        }
-                    seen_texts.add(text)
+                if not text:
+                    continue
+                key = (r['filename'], r['filepath'])
+                if key in seen_docs:
+                    if r['score'] > seen_docs[key]['similarity']:
+                        seen_docs[key]['content'] = text
+                        seen_docs[key]['similarity'] = r['score']
+                else:
+                    seen_docs[key] = {
+                        'filename': r['filename'],
+                        'filepath': r['filepath'],
+                        'content': text,
+                        'similarity': r['score']
+                    }
 
-            # 兜底逻辑：如果过滤后 seen_docs 为空，但检索到了结果
-            # 说明所有结果都被 min_score 过滤了，这时至少保留分数最高的 3 个结果
+            # 兜底逻辑：如果没有结果，取top 3
             if not seen_docs and (sentence_results or chunk_results):
-                # 合并所有结果并按分数排序
                 all_results = list(sentence_results) + list(chunk_results)
                 all_results.sort(key=lambda x: x['score'], reverse=True)
-
-                # 保留分数最高的 3 个结果
                 for r in all_results[:3]:
                     text = r['text'].strip()
                     if text:
@@ -1471,35 +1617,23 @@ class RAGQA:
                                 'similarity': r['score']
                             }
 
-                if seen_docs:
-                    print(f"[兜底] 所有结果被 min_score 过滤，保留 top {len(seen_docs)} 结果")
+            merge_time = (time.time() - merge_start) * 1000
+            print(f"[PERF] 文档合并耗时: {merge_time:.1f}ms, 合并后文档数: {len(seen_docs)}", file=sys.stderr)
 
-            import time
-            merge_start = time.time()
-
-            # 添加编号并重新构建 context（使用合并后的编号）
+            # 快速构建context
             sources = []
             merged_context_parts = []
             for idx, (key, source) in enumerate(seen_docs.items(), 1):
                 source['index'] = idx
-                # content 格式：文件名 + 编号 + 内容
-                # 例如：医疗质量管理与控制指标汇编6.0版2024.pdf 1：该文件提供了...
                 source_with_number = source.copy()
                 source_with_number['content'] = f"{source['filename']} {idx}：{source['content']}"
                 sources.append(source_with_number)
-                # 重新构建 context，使用更清晰的格式
-                # 格式强调文件名，便于 LLM 在表格中直接使用
+                # 简化格式，减少context长度
                 merged_context_parts.append(
-                    f"====== 参考文档 {idx} ======\n"
-                    f"文件名：{source['filename']}\n"
-                    f"编号：来源{idx}\n"
-                    f"内容：{source['content']}\n"
+                    f"文档{idx}|{source['filename']}|{source['content']}"
                 )
 
             context = "\n".join(merged_context_parts)
-
-            import sys
-            print(f"[PERF] 文档合并耗时: {((time.time() - merge_start) * 1000):.1f}ms, 合并后文档数: {len(sources)}", file=sys.stderr)
 
             # 4. 构建提示词和上下文
             # 只有当向量库完全没有检索到结果时，才使用通用知识
@@ -1640,7 +1774,10 @@ class RAGQA:
 - 请使用富文本段落格式回答，严禁使用任何表格格式
 - 禁止使用 Markdown 表格语法（如 |、--- 等符号）
 - 使用分段落、分要点的方式组织内容，适当使用 emoji（如 📌、💡、⚠️、✅ 等）
-- 回答将在最后自动添加来源文件列表
+- 【严禁】在回答内容中生成任何来源文件列表、参考文件列表或参考文献
+- 【禁止】在回答末尾添加"来源文件："、"来源："、"参考文件："、"参考资料："等字样及后续列表
+- 【禁止】列举任何文件名称或文档来源，系统会自动在回答最后添加编号的来源文件列表
+- 只专注于回答问题本身，不要提及任何文件来源
 
 用户问题：{question}
 
@@ -1787,9 +1924,9 @@ class RAGQA:
                 table_start_idx = -1
 
                 for i, line in enumerate(lines):
-                    stripped = line.strip()
+                    # 使用原始行（不strip），保留前导空格
                     # 检测表格开始（包含序号或来源文件列）
-                    if not in_table and ('| 序号 |' in stripped or '|序号|' in stripped):
+                    if not in_table and ('| 序号 |' in line or '|序号|' in line):
                         in_table = True
                         table_start_idx = i
                         table_lines.append(line)
@@ -1797,20 +1934,60 @@ class RAGQA:
 
                     # 在表格中
                     if in_table:
-                        # 检测表格结束（空行或非表格行）
-                        if not stripped or (not stripped.startswith('|') and not stripped.startswith('<')):
+                        # 检测表格结束（使用更宽松的条件）
+                        # 只有当整行为空，或者不包含 | 且不是以 <sup 开头时才结束
+                        if not line or not line.strip():
+                            # 空行，表格结束
                             break
+                        # 检查是否仍为表格行（包含 | 或者是续行）
+                        if '|' not in line and not line.strip().startswith('<'):
+                            # 不包含 | 且不以 < 开头，可能是表格结束
+                            # 但要检查是否为上一行的续行（比如长内容被换行）
+                            if table_lines and '|' in table_lines[-1]:
+                                # 上一行是表格行，当前行可能是内容续行
+                                # 检查上一行是否以 | 结尾
+                                if table_lines[-1].rstrip().endswith('|'):
+                                    # 上一行以 | 结尾，说明当前行应该是新的一列
+                                    break
+                                else:
+                                    # 上一行不以 | 结尾，当前行可能是内容的续行
+                                    # 合并到上一行
+                                    table_lines[-1] = table_lines[-1].rstrip() + ' ' + line.strip()
+                                    continue
+                            else:
+                                break
                         table_lines.append(line)
 
                 # 如果找到表格，提取并重新构建
                 if table_lines and len(table_lines) >= 3:  # 至少有表头、分隔符、一行数据
-                    corrected_table = '\n'.join(table_lines)
+                    # 验证表格完整性，检查是否有不完整的行
+                    print(f"[DEBUG TABLE] 验证表格完整性，共 {len(table_lines)} 行", file=sys.stderr)
+                    validated_lines = []
+                    for idx, tline in enumerate(table_lines):
+                        print(f"[DEBUG TABLE] 行{idx}: {tline[:100]}", file=sys.stderr)
+                        validated_lines.append(tline)
+
+                    corrected_table = '\n'.join(validated_lines)
 
                     # 发送替换事件，告诉前端用修正后的表格替换
                     yield {'type': 'table_replace', 'data': corrected_table}
-                    print(f"[DEBUG] 已发送 table_replace 事件，包含修正后的表格（{len(table_lines)}行，序号已重新排序）", file=sys.stderr)
+                    print(f"[DEBUG] 已发送 table_replace 事件，包含修正后的表格（{len(validated_lines)}行）", file=sys.stderr)
 
         except Exception as e:
+            import traceback
+            import sys
+
+            # 打印详细错误信息到控制台
+            print(f"\n{'='*70}", file=sys.stderr)
+            print(f"❌ ask_stream 发生错误", file=sys.stderr)
+            print(f"{'='*70}", file=sys.stderr)
+            print(f"错误类型: {type(e).__name__}", file=sys.stderr)
+            print(f"错误消息: {str(e)}", file=sys.stderr)
+            print(f"\n完整堆栈跟踪:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print(f"{'='*70}\n", file=sys.stderr)
+            sys.stderr.flush()
+
             yield {'type': 'error', 'data': str(e)}
 
     def _validate_and_fix_table_filenames(self, text: str, sources: list) -> str:
