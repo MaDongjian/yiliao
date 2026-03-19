@@ -1905,7 +1905,42 @@ class RAGQA:
                 # 额外发送来源列表作为 content 事件（确保前端能显示）
                 yield {'type': 'content', 'data': sources_list}
 
-            # 10. 完成，返回处理后的最终答案
+            # 10. 智能格式化输出（新增）
+            # 使用智能分类器识别问题类型并生成结构化数据
+            if _has_sources and sources:
+                try:
+                    from src.smart_answer_formatter import SmartAnswerFormatter
+
+                    # 构造 result 字典
+                    result = {
+                        'answer': final_answer,
+                        'sources': sources,
+                        'question': question
+                    }
+
+                    # 智能格式化
+                    formatter = SmartAnswerFormatter()
+                    formatted_result = formatter.format(question, result)
+
+                    # 发送结构化数据事件
+                    yield {
+                        'type': 'structured_data',
+                        'data': {
+                            'question_type': formatted_result['question_type'],
+                            'format_type': formatted_result['format_type'],
+                            'confidence': formatted_result['confidence'],
+                            'content': formatted_result['content'],
+                            'sources': formatted_result['sources']
+                        }
+                    }
+                    print(f"[DEBUG] 已发送智能格式化数据，类型: {formatted_result['question_type']}, 格式: {formatted_result['format_type']}", file=sys.stderr)
+                except Exception as e:
+                    # 智能格式化失败不影响正常流程
+                    print(f"[WARNING] 智能格式化失败: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc()
+
+            # 11. 完成，返回处理后的最终答案
             # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
 
             if _has_sources:
