@@ -1010,6 +1010,35 @@ class RAGQA:
 
         return False
 
+    def _is_followup_question(self, question: str) -> bool:
+        """
+        检测问题是否为追问类型（如"整理成表格"、"详细说明"等）
+
+        Args:
+            question: 用户问题
+
+        Returns:
+            True 如果是追问问题，否则 False
+        """
+        # 追问关键词列表（这些关键词表明用户想要对上一次回答进行整理或补充）
+        followup_keywords = [
+            '整理成表格', '整理为表格', '做成表格', '生成表格', '表格形式',
+            '详细说明', '详细解释', '展开说说', '具体说明', '详细点',
+            '总结', '概括', '简要概括', '总结一下',
+            '分点说明', '列点说明', '条理清晰',
+            '更详细', '更具体', '详细一点', '具体一点',
+            '继续', '接着说', '还有吗',
+            '重复', '再说一遍'
+        ]
+
+        question_lower = question.lower()
+        for keyword in followup_keywords:
+            if keyword in question_lower:
+                print(f"[DEBUG] 检测到追问问题: {keyword}")
+                return True
+
+        return False
+
     def _convert_citations_to_filename(self, text: str, sources: list = None) -> str:
         """
         将文本中的引用标记转换为文件名称格式
@@ -1249,10 +1278,48 @@ class RAGQA:
 
             context = "\n".join(merged_context_parts)
 
+            # 2.5 判断是否为有效上下文（避免显示无关的来源文件）
+            # 不仅要检索到文档，还要确保文档真正相关
+            has_valid_context = False  # 默认为False，需要明确证明有效
+
+            # 2.5.1 领域关键词检查：如果问题包含明显不属于知识库领域的关键词，直接判定为无效
+            out_of_domain_keywords = [
+                'python', 'pandas', 'numpy', 'java', 'javascript', '编程', '代码', '软件',
+                '数据库', 'mysql', 'postgresql', 'redis', 'mongodb', 'git', 'docker',
+                'kubernetes', 'linux', 'windows', 'mac', '安装', '下载', '教程'
+            ]
+            question_lower = question.lower()
+            has_out_of_domain_keywords = any(kw in question_lower for kw in out_of_domain_keywords)
+
+            if has_out_of_domain_keywords:
+                matched_keywords = [kw for kw in out_of_domain_keywords if kw in question_lower]
+                print(f"[DEBUG ask] 问题包含非领域关键词: {matched_keywords}，判定为无效上下文")
+                has_valid_context = False
+            elif has_context and seen_docs:
+                # 计算有效文档数量（相似度 > 0.25）和平均相似度
+                valid_docs = [s for s in seen_docs.values() if s.get('similarity', 0) > 0.25]
+                avg_similarity = sum(s.get('similarity', 0) for s in seen_docs.values()) / len(seen_docs) if seen_docs else 0
+
+                # 只有满足以下条件之一才认为有有效上下文：
+                # 1. 有至少2个高相似度文档（相似度 > 0.35，提高阈值）
+                # 2. 有至少3个中等相似度文档（相似度 > 0.25，提高阈值）
+                # 3. 平均相似度 > 0.35（提高阈值）
+                high_sim_docs = [s for s in seen_docs.values() if s.get('similarity', 0) > 0.35]
+
+                if len(high_sim_docs) >= 2:
+                    has_valid_context = True
+                elif len(valid_docs) >= 3:
+                    has_valid_context = True
+                elif avg_similarity > 0.35:
+                    has_valid_context = True
+                else:
+                    has_valid_context = False
+                    print(f"[DEBUG ask] 无效上下文：文档质量不足（高相似度:{len(high_sim_docs)}, 中等相似度:{len(valid_docs)}, 平均相似度:{avg_similarity:.2f}）")
+
             # 3. 构建提示词和上下文
-            # 只有当向量库完全没有检索到结果时，才使用通用知识
-            # 如果检索到了结果（即使分数较低），也应该使用这些文档
-            if not has_context:
+            # 只有当向量库检索到有效相关的结果时，才使用文档回答
+            # 否则使用千问模型的通用知识
+            if not has_valid_context:
                 # 向量库完全没有检索到相关信息，使用通用知识回答（富文本段落风格，严禁使用表格）
                 context = f"""你是一个友好的 AI 助手。由于文档库中没有找到与该问题直接相关的信息，请根据你的通用知识回答。
 
@@ -1447,7 +1514,7 @@ class RAGQA:
                         has_table = True
 
             # 如果是表格格式，验证并修正表格中的文件名和序号
-            if sources and has_table:
+            if has_valid_context and sources and has_table:
                 import time
                 validate_start = time.time()
                 answer = self._validate_table_filenames_only(answer, sources)
@@ -1455,8 +1522,8 @@ class RAGQA:
                 print(f"[PERF] 表格验证和序号修正耗时: {validate_time:.1f}ms", file=sys.stderr)
 
             # 8. 添加来源列表（纯文本格式时）
-            # 如果不是表格格式且有来源文件，在答案最后添加来源列表
-            if sources and not has_table:
+            # 如果不是表格格式且有有效来源文件，在答案最后添加来源列表
+            if has_valid_context and sources and not has_table:
                 # 构建来源列表，添加 <sup> 标签
                 sources_list = "\n\n---\n\n**来源文件：**\n\n"
                 for idx, source in enumerate(sources, 1):
@@ -1468,8 +1535,8 @@ class RAGQA:
                 answer += sources_list
 
             # 8. 返回结果
-            # 注意：当没有来源时，不返回 sources 字段，避免前端显示空的来源区域
-            if sources:
+            # 注意：当没有有效来源时，不返回 sources 字段，避免前端显示空的来源区域
+            if has_valid_context and sources:
                 return {
                     'question': question,
                     'answer': answer,
@@ -1491,9 +1558,9 @@ class RAGQA:
                 'success': False
             }
 
-    def ask_stream(self, question: str, top_k: int = 6, method: str = "hybrid", temperature: float = None, do_sample: bool = None, min_score: float = 0.15):
+    def ask_stream(self, question: str, top_k: int = 6, method: str = "hybrid", temperature: float = None, do_sample: bool = None, min_score: float = 0.15, conversation_history: list = None):
         """
-        流式提问并生成答案（性能优化版）
+        流式提问并生成答案（性能优化版，支持多轮对话）
 
         Args:
             question: 用户问题
@@ -1502,6 +1569,7 @@ class RAGQA:
             temperature: 采样温度（0.8-1.2 有随机性）
             do_sample: 是否使用采样（True 有随机性）
             min_score: 最小相似度阈值（默认0.3，低于此值的结果将被过滤）
+            conversation_history: 对话历史列表，格式: [{'role': 'user', 'content': '...'}, {'role': 'assistant', 'content': '...'}]
 
         Yields:
             {
@@ -1620,6 +1688,67 @@ class RAGQA:
             merge_time = (time.time() - merge_start) * 1000
             print(f"[PERF] 文档合并耗时: {merge_time:.1f}ms, 合并后文档数: {len(seen_docs)}", file=sys.stderr)
 
+            # 3.5 判断是否为有效上下文（避免显示无关的来源文件）
+            # 不仅要检索到文档，还要确保文档真正相关
+            has_valid_context = False  # 默认为False，需要明确证明有效
+
+            # 3.5.1 领域关键词检查：如果问题包含明显不属于知识库领域的关键词，直接判定为无效
+            # 知识库领域：医疗消毒、医院感染、手卫生等
+            # 非领域关键词（示例）：编程、软件、开发、python、java、安装等
+            out_of_domain_keywords = [
+                'python', 'pandas', 'numpy', 'java', 'javascript', '编程', '代码', '软件',
+                '数据库', 'mysql', 'postgresql', 'redis', 'mongodb', 'git', 'docker',
+                'kubernetes', 'linux', 'windows', 'mac', '安装', '下载', '教程'
+            ]
+            question_lower = question.lower()
+            has_out_of_domain_keywords = any(kw in question_lower for kw in out_of_domain_keywords)
+
+            if has_out_of_domain_keywords:
+                # 问题包含明显的非领域关键词，即使检索到文档也认为无效
+                matched_keywords = [kw for kw in out_of_domain_keywords if kw in question_lower]
+                print(f"\n{'='*70}")
+                print(f"[DEBUG DOMAIN] 问题包含非领域关键词: {matched_keywords}")
+                print(f"[DEBUG DOMAIN] 判定为无效上下文（非医疗领域问题）")
+                print(f"{'='*70}\n")
+                has_valid_context = False
+            elif has_context and seen_docs:
+                # 详细记录每个文档的相似度
+                print(f"\n{'='*70}")
+                print(f"[DEBUG VALID CONTEXT] 检索到 {len(seen_docs)} 个文档")
+                for i, (key, doc) in enumerate(seen_docs.items(), 1):
+                    filename = doc.get('filename', 'unknown')
+                    similarity = doc.get('similarity', 0)
+                    print(f"[DEBUG VALID CONTEXT] 文档{i}: {filename}, 相似度: {similarity:.3f}")
+
+                # 计算有效文档数量（相似度 > 0.25）和平均相似度
+                valid_docs = [s for s in seen_docs.values() if s.get('similarity', 0) > 0.25]
+                avg_similarity = sum(s.get('similarity', 0) for s in seen_docs.values()) / len(seen_docs) if seen_docs else 0
+
+                # 只有满足以下条件之一才认为有有效上下文：
+                # 1. 有至少2个高相似度文档（相似度 > 0.35，提高阈值）
+                # 2. 有至少3个中等相似度文档（相似度 > 0.25，提高阈值）
+                # 3. 平均相似度 > 0.35（提高阈值）
+                high_sim_docs = [s for s in seen_docs.values() if s.get('similarity', 0) > 0.35]
+
+                print(f"[DEBUG VALID CONTEXT] 统计：高相似度(>0.35): {len(high_sim_docs)}, 中等相似度(>0.25): {len(valid_docs)}, 平均相似度: {avg_similarity:.3f}")
+
+                if len(high_sim_docs) >= 2:
+                    has_valid_context = True
+                    print(f"[DEBUG VALID CONTEXT] ✅ 有效上下文：高相似度文档 {len(high_sim_docs)} 个")
+                elif len(valid_docs) >= 3:
+                    has_valid_context = True
+                    print(f"[DEBUG VALID CONTEXT] ✅ 有效上下文：中等相似度文档 {len(valid_docs)} 个")
+                elif avg_similarity > 0.35:
+                    has_valid_context = True
+                    print(f"[DEBUG VALID CONTEXT] ✅ 有效上下文：平均相似度 {avg_similarity:.2f}")
+                else:
+                    has_valid_context = False
+                    print(f"[DEBUG VALID CONTEXT] ❌ 无效上下文：文档质量不足")
+                print(f"{'='*70}\n")
+            else:
+                has_valid_context = False
+                print(f"[DEBUG VALID CONTEXT] ❌ 无效上下文：没有检索到文档")
+
             # 快速构建context
             sources = []
             merged_context_parts = []
@@ -1635,23 +1764,99 @@ class RAGQA:
 
             context = "\n".join(merged_context_parts)
 
-            # 4. 构建提示词和上下文
-            # 只有当向量库完全没有检索到结果时，才使用通用知识
-            # 如果检索到了结果（即使分数较低），也应该使用这些文档
-            if not has_context:
-                # 向量库完全没有检索到相关信息，使用通用知识回答（富文本段落风格，严禁使用表格）
-                context = f"""你是一个友好的 AI 助手。由于文档库中没有找到与该问题直接相关的信息，请根据你的通用知识回答。
+            # 4. 构建对话上下文（如果提供）
+            conversation_context = ""
+            if conversation_history and len(conversation_history) > 0:
+                # 将历史对话转换为上下文，但不使用"历史对话"等术语
+                recent_history = conversation_history[-6:]  # 只取最近6轮，避免上下文过长
+                context_parts = []
+                for i, msg in enumerate(recent_history):
+                    role = "用户" if msg['role'] == 'user' else "助手"
+                    content = msg['content']
 
-【问题】
+                    # 对用户问题和AI回答使用不同的截断策略
+                    if msg['role'] == 'user':
+                        # 用户问题：最多保留300个字符（通常问题不会太长）
+                        if len(content) > 300:
+                            content = content[:300] + "..."
+                    else:
+                        # AI回答：保留更多内容（最多2000字符），因为用户可能需要基于完整回答进行后续操作
+                        # 比如"帮我整理成表格"需要基于上一轮的完整回答
+                        if len(content) > 2000:
+                            content = content[:2000] + "...(内容过长，已截断)"
+
+                    context_parts.append(f"{role}：{content}")
+
+                if context_parts:
+                    conversation_context = "\n".join(context_parts)
+                    conversation_context = f"\n【对话背景】\n{conversation_context}\n"
+
+            # 5. 构建提示词和上下文
+            # 只有当向量库检索到有效相关的结果时，才使用文档回答
+            # 否则使用千问模型的通用知识
+
+            # 检测是否为追问类型问题（如"整理成表格"、"详细说明"等）
+            is_followup_question = self._is_followup_question(question)
+
+            # 调试输出
+            if is_followup_question:
+                print(f"[DEBUG FOLLOWUP] 检测到追问问题: {question}")
+            if conversation_history and len(conversation_history) > 0:
+                print(f"[DEBUG FOLLOWUP] 对话历史轮数: {len(conversation_history)}")
+                last_msg = conversation_history[-1]
+                print(f"[DEBUG FOLLOWUP] 上一条消息角色: {last_msg['role']}, 内容长度: {len(last_msg['content'])} 字符")
+
+            # 重要：如果是追问问题且有对话历史，将 has_valid_context 设置为 False
+            # 这样就不会显示新检索到的来源文件，因为追问是基于对话历史的整理，不需要新的来源
+            if is_followup_question and conversation_history and len(conversation_history) > 0:
+                print(f"[DEBUG FOLLOWUP] 追问模式：清空来源列表（基于对话历史整理，不显示检索来源）")
+                print(f"[DEBUG FOLLOWUP] 清空前：sources数量={len(sources) if sources else 0}, has_valid_context={has_valid_context}")
+                has_valid_context = False  # 强制设置为 False，避免显示新检索的来源
+                sources = []  # 清空来源列表
+                print(f"[DEBUG FOLLOWUP] 清空后：sources数量={len(sources) if sources else 0}, has_valid_context={has_valid_context}")
+
+            if not has_valid_context:
+                # 向量库没有检索到真正相关的信息，使用千问模型的通用知识回答
+                # 同时融入对话上下文帮助模型理解
+
+                if is_followup_question and conversation_history:
+                    # 是追问问题且有对话历史，基于对话历史回答
+                    context = f"""你是一个友好的 AI 助手。用户正在对你之前的回答进行追问或要求整理。
+
+{conversation_context}
+【当前追问】
 {question}
 
 【重要指示 - 必须严格遵守】
-1. 回答格式：使用富文本段落格式，禁止使用任何表格格式
-2. 严禁使用 Markdown 表格语法（如 |、--- 等符号）
-3. 使用分段落的方式组织内容，每段聚焦一个要点
-4. 适当使用 emoji 让回答更生动（如 📌、💡、⚠️、✅ 等）
-5. 如果涉及医疗健康问题，开头必须说明："⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。"
-6. 绝对不要编造或虚构任何来源文件名称
+1. 用户的问题是基于【对话背景】中助手上一次回答的追问
+2. 请仔细阅读【对话背景】中助手最后一次回答的内容
+3. 根据追问的具体要求，对上一次回答的内容进行整理或补充
+4. 如果用户要求"整理成表格"，请将上次回答的内容整理成 Markdown 表格格式
+5. 如果用户要求"详细说明"，请对上次回答的要点进行更详细的解释
+6. 如果用户要求"总结"，请对上次回答的内容进行简洁的总结
+7. 不要编造新信息，只基于上一次回答的内容进行整理
+8. 不要引用任何新的文档或来源文件
+9. 如果生成表格，表格列应为：序号、主题/分类、内容/说明
+10. 严禁添加"参考文献"、"来源文件"等列，不要使用 [数字] 格式的引用
+
+请按照用户的要求，基于【对话背景】中助手上一次回答的内容直接给出整理后的结果：
+"""
+                else:
+                    # 不是追问，或没有对话历史，使用通用知识回答
+                    context = f"""你是一个友好的 AI 助手。文档库中没有找到与该问题直接相关的信息，请使用你自己的通用知识来回答。
+
+{conversation_context}
+【当前问题】
+{question}
+
+【重要指示 - 必须严格遵守】
+1. 请基于你的训练数据和通用知识回答问题
+2. 回答格式：使用富文本段落格式，禁止使用任何表格格式
+3. 严禁使用 Markdown 表格语法（如 |、--- 等符号）
+4. 使用分段落的方式组织内容，每段聚焦一个要点
+5. 适当使用 emoji 让回答更生动（如 📌、💡、⚠️、✅ 等）
+6. 如果涉及医疗健康问题，开头必须说明："⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。"
+7. 绝对不要编造或虚构任何来源文件名称
 
 【回答格式示例】
 ⚠️ 以下是基于通用知识的回答，具体请咨询专业医生。
@@ -1671,8 +1876,37 @@ class RAGQA:
 """
             else:
                 # 有检索到相关信息，使用文档回答
-                # 4. 检测是否需要表格格式
-                use_table_format = self._should_use_table_format(question)
+                # 4. 检测是否为追问问题
+                if is_followup_question and conversation_history:
+                    # 是追问问题且有对话历史，优先基于对话历史回答
+                    # 构建基于对话历史的prompt（不使用向量检索结果）
+                    context = f"""你是一个友好的 AI 助手。用户正在对你之前的回答进行追问或要求整理。
+
+{conversation_context}
+【当前追问】
+{question}
+
+【重要指示 - 必须严格遵守】
+1. 用户的问题是基于【对话背景】中助手上一次回答的追问
+2. 请仔细阅读【对话背景】中助手最后一次回答的内容
+3. 根据追问的具体要求，对上一次回答的内容进行整理或补充
+4. 如果用户要求"整理成表格"，请将上次回答的内容整理成 Markdown 表格格式
+5. 如果用户要求"详细说明"，请对上次回答的要点进行更详细的解释
+6. 如果用户要求"总结"，请对上次回答的内容进行简洁的总结
+7. 不要编造新信息，只基于上一次回答的内容进行整理
+8. 不要引用任何新的文档或来源文件
+9. 如果生成表格，表格列应为：序号、主题/分类、内容/说明
+10. 严禁添加"参考文献"、"来源文件"等列，不要使用 [数字] 格式的引用
+
+请按照用户的要求，基于【对话背景】中助手上一次回答的内容直接给出整理后的结果：
+"""
+                    print(f"[DEBUG FOLLOWUP] 使用纯对话历史模式，不包含向量检索结果")
+                    use_table_format = False  # 追问模式下不使用标准表格格式检测
+                else:
+                    # 非追问，使用标准文档回答流程
+                    # 5. 检测是否需要表格格式
+                    use_table_format = self._should_use_table_format(question)
+
                 if use_table_format and sources:
                     # 构建可用文件名列表
                     available_filenames = '\n'.join([f"  - {source['filename']}" for source in sources])
@@ -1769,8 +2003,8 @@ class RAGQA:
                     print(f"检测到表格关键词，将使用表格格式回答")
                     print(f"[DEBUG] 可用文件名: {[s['filename'] for s in sources]}")
                 else:
-                    # 非表格格式，添加明确的禁止表格指示
-                    context = f"""【重要指示】
+                    # 非表格格式，添加明确的禁止表格指示，融入对话上下文
+                    context = f"""{conversation_context}【重要指示】
 - 请使用富文本段落格式回答，严禁使用任何表格格式
 - 禁止使用 Markdown 表格语法（如 |、--- 等符号）
 - 使用分段落、分要点的方式组织内容，适当使用 emoji（如 📌、💡、⚠️、✅ 等）
@@ -1783,15 +2017,18 @@ class RAGQA:
 
 {context}"""
 
-            # 5. 返回来源信息（只在有来源时返回）
-            if has_context and sources:
+            # 6. 返回来源信息（只在有有效来源时返回）
+            print(f"[DEBUG SOURCES] 准备返回来源信息：has_valid_context={has_valid_context}, sources数量={len(sources) if sources else 0}, is_followup={is_followup_question}", file=sys.stderr)
+            if has_valid_context and sources:
                 yield {'type': 'source', 'data': sources}
                 _sources_list = sources
                 _has_sources = True
+                print(f"[DEBUG SOURCES] ✓ 发送 source 事件，来源数量: {len(sources)}", file=sys.stderr)
             else:
-                # 没有来源时不返回 source 事件
+                # 没有有效来源时不返回 source 事件
                 _sources_list = []
                 _has_sources = False
+                print(f"[DEBUG SOURCES] ✗ 不发送 source 事件（原因：valid={has_valid_context}, sources={len(sources) if sources else 0}）", file=sys.stderr)
 
             # 6. 流式生成回答
             yield {'type': 'status', 'data': '正在生成回答...'}
@@ -1880,6 +2117,7 @@ class RAGQA:
             # 9. 添加来源列表（纯文本格式时）
             # 如果不是表格格式且有来源文件，在答案最后添加来源列表
             sources_list = ""
+            print(f"[DEBUG SOURCES] 检查是否追加来源列表：_has_sources={_has_sources}, sources数量={len(sources) if sources else 0}, has_table={has_table}, is_followup={is_followup_question}", file=sys.stderr)
             if _has_sources and sources and not has_table:
                 # 先按文件名去重，避免来源列表中出现重复文件
                 seen_filenames = {}

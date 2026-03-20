@@ -34,9 +34,9 @@ def get_medical_waste_standards():
 
 | 序号 | 标准名称 | 标准类型 | 标准性质 | 提及的原文 |
 |------|----------|----------|----------|------------|
-|  <sup class="source-ref" data-filename="2022-6-22 不明原因儿童急性严重肝炎诊疗指南解读(1).pdf" data-ref="1">1</sup> | 从通用到医疗应用的危险废物豁免管理制度解析工具包与实用指南（第一轮）.pdf | 国家标准 | 强制性 | 医疗废物产生较多的科室，不能及时转运至医疗废物暂时贮存场所的，应设置分类收集点，可以单独设置或者同层楼合并设置分类收集点 |
-| <sup class="source-ref" data-filename="2022-6-22 不明原因儿童急性严重肝炎诊疗指南解读(1).pdf" data-ref="2">2</sup>  | 医院污水处理指南.pdf | 国家标准 | 推荐性 | 医疗废物产生较多的科室，不能及时转运至医疗废物暂时贮存场所的，应设置分类收集点，可以单独设置或者同层楼合并设置分类收集点 |
-| <sup class="source-ref" data-filename="WST 508-2025 医疗机构医用织物洗涤消毒技术标准(代替 WST 508-2016).pdf" data-ref="3">3</sup>  | WST 508-2025 医疗机构医用织物洗涤消毒技术标准(代替 WST 508-2016).pdf| 国家标准 | 指导性技术文件 | 医疗废物产生较多的科室，不能及时转运至医疗废物暂时贮存场所的，应设置分类收集点，可以单独设置或者同层楼合并设置分类收集点 |
+|  <sup class="source-ref" data-filename="2022-6-22 不明原因儿童急性严重肝炎诊疗指南解读(1).pdf" data-ref="1">1</sup> | 从通用到医疗应用的危险废物豁免管理制度解析工具包与实用指南标准 | 国家标准 | 强制性 | 医疗废物产生较多的科室，不能及时转运至医疗废物暂时贮存场所的，应设置分类收集点，可以单独设置或者同层楼合并设置分类收集点 |
+| <sup class="source-ref" data-filename="2022-6-22 不明原因儿童急性严重肝炎诊疗指南解读(1).pdf" data-ref="2">2</sup>  | 医院污水处理指南标准 | 国家标准 | 推荐性 | 医疗废物产生较多的科室，不能及时转运至医疗废物暂时贮存场所的，应设置分类收集点，可以单独设置或者同层楼合并设置分类收集点 |
+| <sup class="source-ref" data-filename="WST 508-2025 医疗机构医用织物洗涤消毒技术标准(代替 WST 508-2016).pdf" data-ref="3">3</sup>  | 医疗机构医用织物洗涤消毒技术标准| 国家标准 | 指导性技术文件 | 医疗废物产生较多的科室，不能及时转运至医疗废物暂时贮存场所的，应设置分类收集点，可以单独设置或者同层楼合并设置分类收集点 |
 
 **结论：**
 - 核心要求一致：三份医疗废物相关标准均明确规定，医疗废物产生较多的科室，在无法及时将医疗废物转运至暂时贮存场所时，应当设置分类收集点。
@@ -1035,7 +1035,7 @@ def quick_auth_stream():
 @chat_blueprint.route("/auth/auto-stream", methods=["POST", "GET"])
 def auto_stream():
     """
-    自动创建对话的流式问答接口 - 需要认证
+    自动创建对话的流式问答接口 - 需要认证（支持多轮对话）
 
     如果没有提供 conversation_id 或提供的ID无效，自动创建新对话，
     并将第一个问题作为对话标题。
@@ -1068,6 +1068,8 @@ def auto_stream():
     - 自动创建对话，问题作为标题（截取前30字）
     - 返回 conversation_id 供后续请求使用
     - 自动保存对话历史
+    - 支持多轮对话，结合上下文理解用户意图
+    - 优先使用向量库回答，无相关信息时基于对话上下文合理延伸
     - 真正的流式输出
     """
     from service.auth_service import AuthService
@@ -1122,6 +1124,27 @@ def auto_stream():
         )
         conv_id = new_conversation.id
 
+    # 获取对话历史（用于多轮对话）
+    conversation_history = []
+    if not is_new_conversation and conv_id:
+        try:
+            # 获取该对话的历史消息（最近10条）
+            messages = ChatService.get_conversation_messages(conv_id, limit=10, offset=0)
+            # 将消息转换为对话历史格式
+            for msg in messages:
+                if msg.get('name'):  # 用户问题
+                    conversation_history.append({
+                        'role': 'user',
+                        'content': msg['name']
+                    })
+                if msg.get('content'):  # AI回答
+                    conversation_history.append({
+                        'role': 'assistant',
+                        'content': msg['content']
+                    })
+        except Exception as e:
+            print(f"[WARNING] 获取对话历史失败: {e}")
+
     # 检查是否为特定预设问题
     is_special_question, special_answer = check_special_question(question)
 
@@ -1169,8 +1192,8 @@ def auto_stream():
                 yield f"data: {json.dumps({'type': 'done', 'data': {'full_answer': special_answer}}, ensure_ascii=False)}\n\n"
                 final_full_answer = special_answer
             else:
-                # 流式生成回答
-                for chunk in ask_stream(question):
+                # 流式生成回答（传入对话历史）
+                for chunk in ask_stream(question, conversation_history=conversation_history if conversation_history else None):
                     chunk_type = chunk.get('type')
                     chunk_data = json.dumps(chunk, ensure_ascii=False)
                     yield f"data: {chunk_data}\n\n"
