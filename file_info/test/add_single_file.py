@@ -846,7 +846,7 @@ def batch_add_files(
                     'chunks_count': result.get('chunks_count'),
                     'db_record_id': result.get('db_record_id')
                 })
-                print(f"  ✓ 成功: 文档ID={result.get('doc_id')}, 向量数={result.get('total_vectors')}")
+                print(f"  [OK] 成功: 文档ID={result.get('doc_id')}, 向量数={result.get('total_vectors')}")
             else:
                 stats['failed'] += 1
                 stats['results'].append({
@@ -854,7 +854,7 @@ def batch_add_files(
                     'status': result['status'],
                     'reason': result.get('reason', 'unknown')
                 })
-                print(f"  ✗ 失败: {result.get('reason', 'unknown')}")
+                print(f"  [X] 失败: {result.get('reason', 'unknown')}")
 
         except Exception as e:
             stats['failed'] += 1
@@ -863,7 +863,7 @@ def batch_add_files(
                 'status': 'error',
                 'error': str(e)
             })
-            print(f"  ✗ 异常: {e}")
+            print(f"  [X] 异常: {e}")
 
     # 汇总
     print(f"\n{'='*70}")
@@ -1131,11 +1131,11 @@ def upload_files_to_minio(
                 parser = DocumentParser()
                 parsed = parser.parse(str(file_path))
                 text_length = len(parsed['text'])
-                print(f"  ✓ 解析成功")
+                print(f"  [OK] 解析成功")
                 print(f"  文本长度: {text_length} 字符")
 
             except Exception as e:
-                print(f"  ✗ 解析失败: {e}")
+                print(f"  [X] 解析失败: {e}")
                 result['failed'] += 1
                 result['results'].append({
                     'file': str(file_path),
@@ -1188,12 +1188,12 @@ def upload_files_to_minio(
                 summary = llm.generate(detailed_summary_prompt, context="", max_length=800)
 
                 elapsed = time.time() - summary_start
-                print(f"  ✓ 概要生成成功")
+                print(f"  [OK] 概要生成成功")
                 print(f"  耗时: {elapsed:.1f}秒")
                 print(f"  概要长度: {len(summary)} 字符")
 
             except Exception as e:
-                print(f"  ✗ 概要生成失败: {e}")
+                print(f"  [X] 概要生成失败: {e}")
                 import traceback
                 traceback.print_exc()
                 result['failed'] += 1
@@ -1227,7 +1227,7 @@ def upload_files_to_minio(
                         record.summary = summary
                         db_module.db.session.commit()
                         result['updated_db'] += 1
-                        print(f"  ✓ 数据库已更新 (ID={record.id})")
+                        print(f"  [OK] 数据库已更新 (ID={record.id})")
                         if old_summary:
                             print(f"    旧概要: {old_summary[:50]}...")
                         print(f"    新概要: {summary[:50]}...")
@@ -1236,7 +1236,7 @@ def upload_files_to_minio(
                         print(f"  ⚠ {warning_msg}")
 
                 except Exception as e:
-                    print(f"  ✗ 数据库更新失败: {e}")
+                    print(f"  [X] 数据库更新失败: {e}")
                     import traceback
                     traceback.print_exc()
 
@@ -1393,7 +1393,7 @@ def upload_to_minio_server(
             secret_key=minio_config['secret_key'],
             secure=minio_config['secure']
         )
-        print(f"  ✓ MinIO客户端初始化成功")
+        print(f"  [OK] MinIO客户端初始化成功")
         print(f"    Endpoint: {minio_config['endpoint']}")
         print(f"    Bucket: {bucket_name}")
     except Exception as e:
@@ -1408,9 +1408,9 @@ def upload_to_minio_server(
         if not client.bucket_exists(bucket_name):
             print(f"  存储桶不存在，正在创建...")
             client.make_bucket(bucket_name)
-            print(f"  ✓ 存储桶创建成功")
+            print(f"  [OK] 存储桶创建成功")
         else:
-            print(f"  ✓ 存储桶已存在")
+            print(f"  [OK] 存储桶已存在")
     except S3Error as e:
         return {
             'status': 'error',
@@ -1448,20 +1448,20 @@ def upload_to_minio_server(
                 object_name=object_name,
                 file_path=str(file_path)
             )
-            print(f"    ✓ 上传成功")
+            print(f"    [OK] 上传成功")
 
             result['uploaded'] += 1
             result['minio_paths'][filename] = minio_full_path
 
         except S3Error as e:
             error_msg = f"{filename}: MinIO上传失败 - {str(e)}"
-            print(f"    ✗ {error_msg}")
+            print(f"    [X] {error_msg}")
             result['failed'] += 1
             result['errors'].append(error_msg)
             continue
         except Exception as e:
             error_msg = f"{filename}: 上传失败 - {str(e)}"
-            print(f"    ✗ {error_msg}")
+            print(f"    [X] {error_msg}")
             result['failed'] += 1
             result['errors'].append(error_msg)
             continue
@@ -1487,7 +1487,7 @@ def upload_to_minio_server(
                             record.filepath = minio_path
                             db_module.db.session.commit()
                             result['updated_db'] += 1
-                            print(f"  ✓ 已更新: {filename}")
+                            print(f"  [OK] 已更新: {filename}")
                             print(f"    旧路径: {old_filepath}")
                             print(f"    新路径: {minio_path}")
                         else:
@@ -1497,12 +1497,12 @@ def upload_to_minio_server(
 
                     except Exception as e:
                         error_msg = f"{filename}: 数据库更新失败 - {str(e)}"
-                        print(f"  ✗ {error_msg}")
+                        print(f"  [X] {error_msg}")
                         result['errors'].append(error_msg)
 
         except Exception as e:
             error_msg = f"数据库连接失败: {str(e)}"
-            print(f"  ✗ {error_msg}")
+            print(f"  [X] {error_msg}")
             result['errors'].append(error_msg)
 
     # 打印汇总
@@ -1519,12 +1519,580 @@ def upload_to_minio_server(
 
     return result
 
+def extract_file_attributes(
+    file_path: str,
+    include_text: bool = False,
+    print_details: bool = True
+):
+    """
+    从文件中提取属性信息（标准号、发布日期、实施日期等）
+
+    此函数专注于从文件内容中解析和提取结构化属性，
+    不涉及数据库操作和向量化。
+
+    Args:
+        file_path: 文件路径（支持 .pdf, .docx, .pptx）
+        include_text: 是否在结果中包含完整文本内容（默认False）
+        print_details: 是否打印详细属性信息（默认True）
+
+    Returns:
+        dict: 包含以下键的字典:
+            - status: 'success' 或 'error'
+            - file: 文件路径
+            - filename: 文件名
+            - file_type: 文件类型
+            - file_size: 文件大小（字节）
+            - text: 文本内容（如果 include_text=True）
+            - text_length: 文本长度
+            - attributes: 提取的属性字典 {中文名: 属性值}
+            - attributes_count: 属性数量
+            - attributes_list: 属性列表格式 [{name, value, category}]
+            - message: 处理信息
+
+    示例:
+        # 从文件提取属性
+        result = extract_file_attributes(
+            'E:/docs/标准.pdf',
+            include_text=False
+        )
+
+        if result['status'] == 'success':
+            print(f"文件: {result['filename']}")
+            print(f"提取到 {result['attributes_count']} 个属性")
+
+            # 遍历所有属性
+            for attr in result['attributes_list']:
+                print(f"  {attr['name']}: {attr['value']}")
+    """
+    import re
+    from pathlib import Path
+
+    def extract_standard_number_from_filename(filename: str) -> str:
+        """
+        从文件名中提取标准号（包含英文部分）
+
+        支持的格式:
+        - CJ_T 3083-1999 医疗废弃物焚烧设备技术要求.pdf
+        - YY 0572-2015.pdf
+        - GB 27955-2020.pdf
+        - WST 368-2025 医院空气净化管理标准.pdf
+        - DB11_T 408-2016 医院洁净手术部污染控制规范(北京地标).pdf
+        - GB_T 25915.1-2021.pdf
+
+        Returns:
+            提取的标准号，未找到返回空字符串
+        """
+        # 移除文件扩展名
+        name_without_ext = filename.replace('.pdf', '').replace('.docx', '').replace('.pptx', '')
+
+        # 方法：从文件名开头提取，直到遇到非ASCII字符
+        # 标准号格式: ASCII英文字母开头 + 可含数字/_/T/空格/连字符
+        result = []
+        for char in name_without_ext:
+            # 检查字符的ASCII码范围（只接受英文、数字、空格、下划线、斜杠、连字符）
+            # ord(char) < 128 表示ASCII字符
+            if (ord(char) < 128 and char.isprintable()) or char in '—–':
+                result.append(char)
+            else:
+                # 遇到非ASCII字符（如中文），停止
+                break
+
+        std_num = ''.join(result).strip()
+
+        # 标准化处理
+        std_num = re.sub(r'\s+', ' ', std_num)  # 多个空格变一个
+        std_num = std_num.replace('_', ' ')  # 下划线转空格
+        std_num = std_num.replace('—', '-').replace('–', '-')  # 全角转半角
+        std_num = re.sub(r'\s*-\s*', '-', std_num)  # 移除连字符周围空格
+        std_num = re.sub(r'\s*/\s*', '/', std_num)  # 移除斜杠周围空格
+
+        # 验证结果（至少包含字母和数字）
+        if len(std_num) >= 3 and len(std_num) <= 30 and any(c.isalpha() for c in std_num) and any(c.isdigit() for c in std_num):
+            return std_num
+
+        return ''
+
+    file_path = Path(file_path)
+
+    # 检查文件是否存在
+    if not file_path.exists():
+        return {
+            'status': 'error',
+            'file': str(file_path),
+            'message': f"文件不存在: {file_path}"
+        }
+
+    # 检查文件格式
+    supported_formats = {'.pdf', '.docx', '.pptx'}
+    if file_path.suffix.lower() not in supported_formats:
+        return {
+            'status': 'error',
+            'file': str(file_path),
+            'message': f"不支持的文件格式: {file_path.suffix}"
+        }
+
+    if print_details:
+        print(f"\n{'='*70}")
+        print(f"文件属性提取工具")
+        print(f"{'='*70}")
+        print(f"文件: {file_path.name}")
+        print(f"路径: {file_path}")
+        print(f"类型: {file_path.suffix}")
+        print(f"大小: {file_path.stat().st_size:,} 字节")
+        print(f"{'='*70}\n")
+
+    try:
+        # 1. 解析文档
+        if print_details:
+            print(f"[1/2] 解析文档...")
+
+        parser = DocumentParser()
+        parsed = parser.parse(str(file_path))
+
+        if print_details:
+            print(f"  [OK] 解析成功")
+            print(f"  文本长度: {len(parsed['text']):,} 字符")
+            if 'pages' in parsed:
+                print(f"  页面数: {len(parsed.get('pages', []))}")
+
+        # 2. 提取属性
+        if print_details:
+            print(f"\n[2/2] 提取文档属性...")
+
+        extractor = AttributeExtractor()
+        attributes = extractor.extract(parsed['text'])
+
+        # 从文件名中提取标准号（优先使用文件名中的标准号）
+        filename_std_num = extract_standard_number_from_filename(file_path.name)
+
+        if filename_std_num:
+            if print_details:
+                print(f"  从文件名提取到标准号: {filename_std_num}")
+
+            # 总是使用从文件名提取的标准号（更可靠）
+            # 删除文档内容中提取的标准号（如果有）
+            for attr_id in list(attributes.keys()):
+                if attributes[attr_id]['name'] == '标准号':
+                    if print_details:
+                        print(f"  替换文档中提取的标准号: '{attributes[attr_id]['value']}' -> '{filename_std_num}'")
+                    del attributes[attr_id]
+                    break
+
+            # 添加从文件名提取的标准号
+            attributes['standard_number'] = {
+                'name': '标准号',
+                'value': filename_std_num,
+                'category': '基本信息',
+                'source': 'filename'
+            }
+
+        # 转换为列表格式，方便遍历
+        attributes_list = []
+        attributes_dict = {}
+
+        for attr_id, attr_data in attributes.items():
+            attr_name = attr_data['name']
+            attr_value = attr_data['value']
+            attr_category = attr_data.get('category', '未分类')
+
+            attributes_dict[attr_name] = attr_value
+            attributes_list.append({
+                'id': attr_id,
+                'name': attr_name,
+                'value': attr_value,
+                'category': attr_category
+            })
+
+        if print_details:
+            print(f"  [OK] 提取到 {len(attributes_list)} 个属性:")
+            print(f"\n{'='*70}")
+            print(f"【提取的属性列表】")
+            print(f"{'='*70}")
+
+            for i, attr in enumerate(attributes_list, 1):
+                value_display = attr['value'][:80] + '...' if len(attr['value']) > 80 else attr['value']
+                print(f"{i}. 【{attr['name']}】")
+                print(f"   值: {value_display}")
+                print(f"   分类: {attr['category']}")
+                print()
+
+        # 构建返回结果
+        result = {
+            'status': 'success',
+            'file': str(file_path),
+            'filename': file_path.name,
+            'file_type': file_path.suffix.lower().replace('.', ''),
+            'file_size': file_path.stat().st_size,
+            'text_length': len(parsed['text']),
+            'attributes': attributes_dict,
+            'attributes_count': len(attributes_list),
+            'attributes_list': attributes_list,
+            'message': f'成功提取 {len(attributes_list)} 个属性'
+        }
+
+        # 可选：包含完整文本
+        if include_text:
+            result['text'] = parsed['text']
+            result['pages'] = parsed.get('pages')
+            result['metadata'] = parsed.get('metadata', {})
+
+        if print_details:
+            print(f"{'='*70}")
+            print(f"提取完成！")
+            print(f"{'='*70}")
+            print(f"总属性数: {len(attributes_list)}")
+            print(f"{'='*70}\n")
+
+        return result
+
+    except Exception as e:
+        error_msg = f"提取失败: {str(e)}"
+        if print_details:
+            print(f"\n[X] {error_msg}")
+            import traceback
+            traceback.print_exc()
+
+        return {
+            'status': 'error',
+            'file': str(file_path),
+            'message': error_msg,
+            'error': str(e)
+        }
+
+
+def get_file_attributes_from_db(
+    filename: str = None,
+    filepath: str = None,
+    db_record_id: int = None
+):
+    """
+    从数据库查询文件的属性信息
+
+    Args:
+        filename: 文件名（精确匹配）
+        filepath: 文件路径（精确匹配）
+        db_record_id: 数据库记录ID（优先级最高）
+
+    Returns:
+        dict: 查询结果
+            - status: 'success' 或 'not_found' 或 'error'
+            - record: 属性记录（如果找到）
+            - message: 状态信息
+
+    示例:
+        # 按文件名查询
+        result = get_file_attributes_from_db(filename='标准.pdf')
+
+        # 按文件路径查询
+        result = get_file_attributes_from_db(filepath='E:/docs/标准.pdf')
+
+        # 按数据库ID查询
+        result = get_file_attributes_from_db(db_record_id=5)
+    """
+    try:
+        from core.database import db
+        import settings
+        from flask import Flask
+        from model.table.document_attribute import DocumentAttribute
+
+        # 创建临时 Flask 应用
+        temp_app = Flask(__name__)
+        temp_app.config.from_object(settings)
+        db.init_app(temp_app)
+
+        with temp_app.app_context():
+            query = DocumentAttribute.query
+
+            # 优先使用数据库ID
+            if db_record_id is not None:
+                print(f"按数据库ID查询: {db_record_id}")
+                record = query.filter_by(id=db_record_id).first()
+            elif filepath:
+                print(f"按文件路径查询: {filepath}")
+                # 处理路径格式
+                filepath_normalized = filepath.replace('\\', '/')
+                record = query.filter_by(filepath=filepath_normalized).first()
+                if not record:
+                    # 尝试原始路径
+                    record = query.filter_by(filepath=filepath).first()
+            elif filename:
+                print(f"按文件名查询: {filename}")
+                record = query.filter_by(filename=filename).first()
+            else:
+                return {
+                    'status': 'error',
+                    'message': '必须提供至少一个查询条件（filename/filepath/db_record_id）'
+                }
+
+            if record:
+                print(f"[OK] 找到记录:")
+                print(f"  ID: {record.id}")
+                print(f"  文件名: {record.filename}")
+                print(f"  文档ID: {record.doc_id}")
+                print(f"  属性数量: {record.attributes_count or 0}")
+                print(f"  创建时间: {record.created_at}")
+
+                return {
+                    'status': 'success',
+                    'record': record.to_dict(),
+                    'message': f"找到属性记录，ID: {record.id}"
+                }
+            else:
+                print(f"[X] 未找到匹配的记录")
+                return {
+                    'status': 'not_found',
+                    'record': None,
+                    'message': '未找到匹配的属性记录'
+                }
+
+    except Exception as e:
+        print(f"[X] 查询失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'status': 'error',
+            'message': f"查询失败: {str(e)}",
+            'error': str(e)
+        }
+
+
+def batch_extract_attributes_to_excel(
+    folder_path: str,
+    output_excel_path: str = None,
+    include_text: bool = False,
+    print_details: bool = True,
+    recursive: bool = False
+):
+    """
+    批量提取文件夹下所有文件的属性，并生成Excel表格
+
+    Args:
+        folder_path: 文件夹路径
+        output_excel_path: 输出Excel文件路径（默认为文件夹名_attributes.xlsx）
+        include_text: 是否在结果中包含完整文本内容（默认False）
+        print_details: 是否打印详细处理信息（默认True）
+        recursive: 是否递归处理子文件夹（默认False）
+
+    Returns:
+        dict: 包含以下键的字典:
+            - status: 'success' 或 'error'
+            - total_files: 处理的文件总数
+            - success_count: 成功提取的文件数
+            - error_count: 失败的文件数
+            - errors: 错误列表 [{file, error}]
+            - output_file: 生成的Excel文件路径
+            - message: 处理信息
+
+    示例:
+        # 批量提取当前文件夹的所有文件
+        result = batch_extract_attributes_to_excel(
+            folder_path='E:/docs/标准',
+            output_excel_path='E:/docs/标准属性表.xlsx'
+        )
+
+        if result['status'] == 'success':
+            print(f"处理完成！")
+            print(f"成功: {result['success_count']}/{result['total_files']}")
+            print(f"输出文件: {result['output_file']}")
+    """
+    from pathlib import Path
+    import pandas as pd
+    from datetime import datetime
+
+    folder_path = Path(folder_path)
+
+    # 检查文件夹是否存在
+    if not folder_path.exists() or not folder_path.is_dir():
+        return {
+            'status': 'error',
+            'message': f"文件夹不存在或不是有效目录: {folder_path}"
+        }
+
+    # 设置默认输出路径
+    if output_excel_path is None:
+        output_excel_path = folder_path / f"{folder_path.name}_属性表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    else:
+        output_excel_path = Path(output_excel_path)
+
+    # 支持的文件格式
+    supported_formats = {'.pdf', '.docx', '.pptx'}
+
+    # 获取所有文件
+    if recursive:
+        all_files = [f for f in folder_path.rglob('*') if f.is_file() and f.suffix.lower() in supported_formats]
+    else:
+        all_files = [f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in supported_formats]
+
+    if not all_files:
+        return {
+            'status': 'error',
+            'message': f"文件夹中没有找到支持的文件格式 ({', '.join(supported_formats)})"
+        }
+
+    if print_details:
+        print(f"\n{'='*70}")
+        print(f"批量属性提取工具")
+        print(f"{'='*70}")
+        print(f"文件夹: {folder_path}")
+        print(f"文件数量: {len(all_files)}")
+        print(f"递归处理: {'是' if recursive else '否'}")
+        print(f"输出文件: {output_excel_path.name}")
+        print(f"{'='*70}\n")
+
+    # 存储所有提取结果
+    all_results = []
+    errors = []
+
+    # 收集所有可能的属性名称（用于Excel列）
+    all_attribute_names = set()
+    all_attribute_names.update(['文件名', '文件路径', '文件类型', '文件大小(字节)', '文本长度', '提取状态', '错误信息'])
+
+    # 处理每个文件
+    for i, file_path in enumerate(all_files, 1):
+        if print_details:
+            print(f"[{i}/{len(all_files)}] 处理: {file_path.name}")
+
+        try:
+            # 提取属性
+            result = extract_file_attributes(
+                file_path=str(file_path),
+                include_text=include_text,
+                print_details=False  # 批量处理时不打印详细信息
+            )
+
+            # 构建结果行
+            row_data = {
+                '文件名': file_path.name,
+                '文件路径': str(file_path),
+                '文件类型': file_path.suffix.lower().replace('.', ''),
+                '文件大小(字节)': file_path.stat().st_size,
+                '文本长度': result.get('text_length', 0),
+                '提取状态': result['status'],
+                '错误信息': result.get('message', '') if result['status'] == 'error' else ''
+            }
+
+            # 如果提取成功，添加所有属性
+            if result['status'] == 'success':
+                # 将属性字典中的所有属性添加到行数据中
+                for attr_name, attr_value in result.get('attributes', {}).items():
+                    row_data[attr_name] = attr_value
+                    all_attribute_names.add(attr_name)
+
+                # 添加提取时间
+                row_data['提取时间'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                all_attribute_names.add('提取时间')
+            else:
+                errors.append({
+                    'file': str(file_path),
+                    'error': result.get('message', 'Unknown error')
+                })
+
+            all_results.append(row_data)
+
+            if print_details:
+                if result['status'] == 'success':
+                    print(f"  [OK] 成功提取 {result.get('attributes_count', 0)} 个属性")
+                else:
+                    print(f"  [X] 提取失败: {result.get('message', 'Unknown error')}")
+
+        except Exception as e:
+            error_msg = f"处理异常: {str(e)}"
+            if print_details:
+                print(f"  [X] {error_msg}")
+
+            errors.append({
+                'file': str(file_path),
+                'error': error_msg
+            })
+
+            all_results.append({
+                '文件名': file_path.name,
+                '文件路径': str(file_path),
+                '文件类型': file_path.suffix.lower().replace('.', ''),
+                '文件大小(字节)': file_path.stat().st_size,
+                '文本长度': 0,
+                '提取状态': 'error',
+                '错误信息': error_msg
+            })
+
+    # 生成Excel
+    if print_details:
+        print(f"\n{'='*70}")
+        print(f"生成Excel表格...")
+        print(f"{'='*70}")
+
+    try:
+        # 创建DataFrame
+        df = pd.DataFrame(all_results)
+
+        # 重新排列列顺序：基本信息在前，属性在后
+        basic_columns = ['文件名', '文件类型', '文件大小(字节)', '文本长度', '提取状态']
+        attribute_columns = sorted([col for col in all_attribute_names if col not in basic_columns and col not in ['文件路径', '错误信息']])
+
+        # 只保留实际存在的列
+        columns_to_keep = basic_columns + [col for col in attribute_columns if col in df.columns]
+        if '错误信息' in df.columns:
+            columns_to_keep.append('错误信息')
+
+        df = df[columns_to_keep]
+
+        # 保存到Excel
+        df.to_excel(output_excel_path, index=False, engine='openpyxl')
+
+        if print_details:
+            print(f"  [OK] Excel文件已保存: {output_excel_path}")
+
+    except Exception as e:
+        error_msg = f"生成Excel失败: {str(e)}"
+        if print_details:
+            print(f"  [X] {error_msg}")
+        return {
+            'status': 'error',
+            'message': error_msg,
+            'total_files': len(all_files),
+            'success_count': len([r for r in all_results if r['提取状态'] == 'success']),
+            'error_count': len(errors)
+        }
+
+    # 汇总信息
+    success_count = len([r for r in all_results if r['提取状态'] == 'success'])
+
+    if print_details:
+        print(f"\n{'='*70}")
+        print(f"批量处理完成！")
+        print(f"{'='*70}")
+        print(f"总文件数: {len(all_files)}")
+        print(f"成功: {success_count}")
+        print(f"失败: {len(errors)}")
+
+        if errors and print_details:
+            print(f"\n失败的文件:")
+            for err in errors[:10]:  # 只显示前10个错误
+                print(f"  - {Path(err['file']).name}: {err['error']}")
+            if len(errors) > 10:
+                print(f"  ... 还有 {len(errors) - 10} 个错误")
+
+        print(f"\n输出文件: {output_excel_path}")
+        print(f"{'='*70}\n")
+
+    return {
+        'status': 'success',
+        'total_files': len(all_files),
+        'success_count': success_count,
+        'error_count': len(errors),
+        'errors': errors,
+        'output_file': str(output_excel_path),
+        'message': f'成功处理 {success_count}/{len(all_files)} 个文件'
+    }
+
+
 import faiss
 
 
 if __name__ == "__main__":
     #clear_vector_index()
     batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/标准', use_gpu=True)
+
 
 
 

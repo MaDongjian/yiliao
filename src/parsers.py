@@ -1,22 +1,109 @@
 """
 文档解析器 - 支持 Word、PDF、PPT 格式
+支持图片 OCR 文字识别（使用 PaddleOCR）
 """
 
 import os
+import io
+import base64
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import traceback
 
 
 class DocumentParser:
     """统一的文档解析接口"""
 
-    def __init__(self):
+    def __init__(self, enable_ocr: bool = True, ocr_lang: str = 'ch'):
+        """
+        初始化文档解析器
+
+        Args:
+            enable_ocr: 是否启用图片 OCR 识别（默认 True）
+            ocr_lang: OCR 语言，'ch'中文，'en'英文（默认 'ch'）
+        """
         self.supported_formats = {
             '.docx': self._parse_word,
             '.pdf': self._parse_pdf,
             '.pptx': self._parse_ppt,
         }
+        self.enable_ocr = enable_ocr
+        self.ocr_lang = ocr_lang
+        self._ocr_engine = None  # 延迟初始化
+
+    def _get_ocr_engine(self):
+        """获取 OCR 引擎（延迟初始化）"""
+        if not self.enable_ocr:
+            return None
+
+        if self._ocr_engine is None:
+            try:
+                from paddleocr import PaddleOCR
+                # 初始化 PaddleOCR
+                self._ocr_engine = PaddleOCR(
+                    use_angle_cls=True,
+                    lang=self.ocr_lang,
+                    use_gpu=False,  # 默认使用 CPU，可改为 True
+                    show_log=False  # 关闭日志输出
+                )
+            except ImportError:
+                print("警告: 未安装 PaddleOCR，图片文字识别功能不可用")
+                print("      安装命令: pip install paddleocr paddlepaddle")
+                self._ocr_engine = None
+            except Exception as e:
+                print(f"警告: PaddleOCR 初始化失败: {e}")
+                self._ocr_engine = None
+
+        return self._ocr_engine
+
+    def _ocr_image(self, image_data: bytes, image_name: str = "image") -> str:
+        """
+        对图片进行 OCR 文字识别
+
+        Args:
+            image_data: 图片二进制数据
+            image_name: 图片名称（用于日志）
+
+        Returns:
+            识别出的文本，失败返回空字符串
+        """
+        ocr = self._get_ocr_engine()
+        if ocr is None:
+            return ""
+
+        try:
+            from PIL import Image
+            import numpy as np
+
+            # 将图片数据转换为 PIL Image
+            image = Image.open(io.BytesIO(image_data))
+
+            # 转换为 numpy 数组（RGB 格式）
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            img_array = np.array(image)
+
+            # 使用 PaddleOCR 识别
+            results = ocr.ocr(img_array, cls=True)
+
+            # 提取文字
+            if results and results[0]:
+                texts = []
+                for line in results[0]:
+                    if line and len(line) >= 2:
+                        # line[0] 是坐标，line[1] 是 (文字, 置信度)
+                        text = line[1][0] if line[1] else ""
+                        if text and text.strip():
+                            texts.append(text.strip())
+
+                if texts:
+                    ocr_text = "\n".join(texts)
+                    return f"[图片文字 {image_name}]\n{ocr_text}\n"
+
+        except Exception as e:
+            print(f"图片 {image_name} OCR 识别失败: {e}")
+
+        return ""
 
     def parse(self, file_path: str) -> Dict:
         """
@@ -57,7 +144,7 @@ class DocumentParser:
             raise Exception(f"解析文件 {file_path.name} 失败: {str(e)}\n{traceback.format_exc()}")
 
     def _parse_word(self, file_path: str) -> Dict:
-        """解析 Word (.docx) 文件 - 提取段落、表格、页眉、页脚、文本框等"""
+        """解析 Word (.docx) 文件 - 提取段落、表格、页眉、页脚、文本框、图片等"""
         try:
             from docx import Document
             from docx.oxml import parse_xml
@@ -133,6 +220,34 @@ class DocumentParser:
         except Exception as e:
             pass
 
+        # ===== 7. 提取并识别图片中的文字 =====
+        if self.enable_ocr:
+            try:
+                # 从文档中提取图片
+                # Word 文档的图片存储在 document.xml.rels 中
+                image_count = 0
+                for rel in doc.part.rels.values():
+                    if "image" in rel.target_ref:
+                        try:
+                            image_data = rel.target_part.blob
+                            image_count += 1
+
+                            # 使用 OCR 识别图片中的文字
+                            ocr_text = self._ocr_image(
+                                image_data,
+                                image_name=f"word_img{image_count}"
+                            )
+
+                            if ocr_text:
+                                all_text_parts.append(ocr_text)
+
+                        except Exception as e:
+                            # 单个图片识别失败不影响其他图片
+                            continue
+            except Exception as e:
+                # 图片提取失败不影响文本解析
+                pass
+
         # 合并所有文本
         full_text = "\n".join(all_text_parts)
 
@@ -174,7 +289,7 @@ class DocumentParser:
                 raise Exception(f"所有 PDF 解析方法都失败了: pdfplumber({e}), PyPDF2({e2})")
 
     def _parse_pdf_with_pymupdf(self, file_path: str) -> Dict:
-        """使用 PyMuPDF 解析 PDF - 对中文支持最好"""
+        """使用 PyMuPDF 解析 PDF - 对中文支持最好，支持图片 OCR"""
         import fitz  # PyMuPDF
 
         doc = fitz.open(file_path)
@@ -224,6 +339,39 @@ class DocumentParser:
                 raw_text = page.get_text("text")
                 if raw_text and raw_text.strip():
                     page_text = raw_text.strip()
+
+            # ===== 提取并识别图片中的文字 =====
+            if self.enable_ocr:
+                try:
+                    # 获取页面中的图片列表
+                    image_list = page.get_images()
+                    if image_list:
+                        for img_index, img in enumerate(image_list):
+                            try:
+                                # 获取图片的 xref
+                                xref = img[0]
+
+                                # 提取图片
+                                base_image = doc.extract_image(xref)
+                                if base_image and "image" in base_image:
+                                    image_bytes = base_image["image"]
+                                    image_ext = base_image.get("ext", "png")
+
+                                    # 使用 OCR 识别图片中的文字
+                                    ocr_text = self._ocr_image(
+                                        image_bytes,
+                                        image_name=f"page{page_num + 1}_img{img_index + 1}"
+                                    )
+
+                                    if ocr_text:
+                                        page_text += f"\n{ocr_text}"
+
+                            except Exception as e:
+                                # 单个图片识别失败不影响其他图片
+                                continue
+                except Exception as e:
+                    # 图片提取失败不影响文本解析
+                    pass
 
             if page_text:
                 pages_text.append(page_text)
@@ -323,7 +471,7 @@ class DocumentParser:
         return True
 
     def _parse_ppt(self, file_path: str) -> Dict:
-        """解析 PowerPoint (.pptx) 文件 - 提取文本框、表格、SmartArt、图表、备注等"""
+        """解析 PowerPoint (.pptx) 文件 - 提取文本框、表格、SmartArt、图表、备注、图片等"""
         try:
             from pptx import Presentation
         except ImportError:
@@ -332,6 +480,9 @@ class DocumentParser:
         prs = Presentation(file_path)
         slides_text = []
         full_text_parts = []
+
+        # 用于存储 PPT 中的图片（延迟处理）
+        ppt_images = []
 
         for slide_idx, slide in enumerate(prs.slides):
             slide_content = []
@@ -415,7 +566,26 @@ class DocumentParser:
                     except:
                         pass
 
-            # 7. 提取备注
+                # ===== 7. 提取图片（延迟 OCR 处理） =====
+                if self.enable_ocr and shape.shape_type == 13:  # Picture
+                    try:
+                        # 获取图片数据
+                        if hasattr(shape, 'image'):
+                            image = shape.image
+                            image_data = image.blob
+                            image_filename = image.filename
+
+                            # 存储图片信息，稍后统一处理
+                            ppt_images.append({
+                                'data': image_data,
+                                'name': f"slide{slide_idx + 1}_{image_filename}",
+                                'slide_idx': slide_idx
+                            })
+                    except Exception as e:
+                        # 单个图片提取失败不影响其他图片
+                        continue
+
+            # 8. 提取备注
             try:
                 if hasattr(slide, "notes_slide") and slide.notes_slide:
                     notes_text = slide.notes_slide.notes_text_frame.text.strip()
@@ -429,6 +599,28 @@ class DocumentParser:
             if slide_text:
                 slides_text.append(slide_text)
                 full_text_parts.append(slide_text)
+
+        # ===== 处理所有图片的 OCR =====
+        if self.enable_ocr and ppt_images:
+            # 按幻灯片索引分组图片
+            images_by_slide = {}
+            for img in ppt_images:
+                slide_idx = img['slide_idx']
+                if slide_idx not in images_by_slide:
+                    images_by_slide[slide_idx] = []
+                images_by_slide[slide_idx].append(img)
+
+            # 为每个幻灯片添加 OCR 文字
+            for slide_idx, images in images_by_slide.items():
+                ocr_texts = []
+                for img in images:
+                    ocr_text = self._ocr_image(img['data'], img['name'])
+                    if ocr_text:
+                        ocr_texts.append(ocr_text)
+
+                # 将 OCR 文字添加到对应幻灯片的文本中
+                if ocr_texts and slide_idx < len(full_text_parts):
+                    full_text_parts[slide_idx] += "\n" + "\n".join(ocr_texts)
 
         full_text = "\n\n---\n\n".join(full_text_parts)
 
