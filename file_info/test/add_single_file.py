@@ -22,9 +22,30 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
 
+# Windows multiprocessing 设置（避免 shm.dll 依赖问题）
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['TORCH_MULTIPROCESSING_ENABLED'] = '0'
+
+# 修复 Windows 上 PyTorch shm.dll 问题的额外设置
+import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
+
 # 添加项目根目录到路径
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
+
+# 延迟导入 torch（仅在实际使用时导入，避免启动失败）
+# import torch  # 移到函数内部
+torch_available = False
+try:
+    import torch
+    torch.set_num_threads(1)
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    torch_available = True
+except (ImportError, OSError) as e:
+    print(f"警告: PyTorch 不可用 ({e})")
+    print("      某些功能将被禁用: 概要生成、属性提取、GPU向量化")
 
 from src.parsers import DocumentParser
 from src.chunker import TextChunker
@@ -45,7 +66,7 @@ def add_single_file(
     save_txt: bool = True,
     txt_dir: str = "./txt",
     extract_attributes: bool = True,
-    generate_summary_flag: bool = True,
+    generate_summary_flag: bool = False,  # 默认禁用：需要千问模型，速度慢
     save_to_db: bool = True,
     use_gpu: bool = True
 ):
@@ -81,6 +102,18 @@ def add_single_file(
     if file_path.suffix.lower() not in supported_formats:
         raise ValueError(f"不支持的文件格式: {file_path.suffix}。支持的格式: {sorted(supported_formats)}")
 
+    # 如果 PyTorch 不可用，自动禁用相关功能
+    if not torch_available:
+        if generate_summary_flag:
+            print("\n[警告] PyTorch 不可用，自动禁用概要生成")
+            generate_summary_flag = False
+        if extract_attributes:
+            print("[警告] PyTorch 不可用，自动禁用属性提取")
+            extract_attributes = False
+        if use_gpu:
+            print("[警告] PyTorch 不可用，强制使用CPU模式")
+            use_gpu = False
+
     # 创建输出目录
     output_dir.mkdir(parents=True, exist_ok=True)
     if save_txt:
@@ -106,7 +139,10 @@ def add_single_file(
             }
 
         # 检查是否已存在
-        file_rel_path = str(file_path.relative_to(project_root))
+        try:
+            file_rel_path = str(file_path.relative_to(project_root))
+        except ValueError:
+            file_rel_path = str(file_path)
         if file_rel_path in existing_filepaths or str(file_path) in existing_filepaths:
             print(f"\n[WARNING] 文件已存在于索引中: {file_path.name}")
             print(f"如需重新索引，请先删除data目录下的faiss.index和metadata.json")
@@ -117,11 +153,14 @@ def add_single_file(
             }
 
     # 解析文件
-    print(f"\n[1/5] 解析文件...")
-    parser = DocumentParser()
+    print(f"\n[1/5] 解析文件（支持扫描件 OCR）...")
+    parser = DocumentParser()  # 默认 enable_ocr=True
     try:
         parsed = parser.parse(str(file_path))
-        print(f"  解析成功，文本长度: {len(parsed['text'])} 字符")
+        text_len = len(parsed['text'])
+        print(f"  解析成功，文本长度: {text_len} 字符")
+        if text_len < 500:
+            print(f"  提示: 文本较少，可能包含扫描图片（OCR 已处理）")
     except Exception as e:
         print(f"  解析失败: {e}")
         return {
@@ -210,9 +249,24 @@ def add_single_file(
 
     # 向量化
     print(f"\n[8/8] 向量化...")
-    device = 'cuda' if use_gpu else None
-    if use_gpu:
-        print(f"  使用GPU加速")
+
+    # 检测GPU可用性并选择设备
+    try:
+        import torch
+        if use_gpu and torch.cuda.is_available():
+            device = 'cuda'
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"  ✓ 检测到GPU: {gpu_name}")
+            print(f"  使用GPU进行向量化（加速模式）")
+        else:
+            device = 'cpu'
+            if use_gpu and not torch.cuda.is_available():
+                print(f"  ⚠ 请求使用GPU，但未检测到CUDA")
+            print(f"  使用CPU进行向量化")
+    except:
+        device = 'cpu'
+        print(f"  使用CPU进行向量化")
+
     embedder = EmbeddingModel(
         model_name="bge-large-zh-v1.5",
         cache_dir=Path(model_path).parent,
@@ -223,25 +277,15 @@ def add_single_file(
     print(f"  向量维度: {embeddings.shape[1]}")
     print(f"  向量数量: {embeddings.shape[0]}")
 
-    # 构建术语索引
-    if terms_info:
-        print(f"\n构建术语索引...")
-        try:
-            # 计算该文档的向量索引范围
-            start_vector_idx = len(chunks_metadata) if chunks_metadata else 0
-            vector_indices = list(range(start_vector_idx, start_vector_idx + len(chunks)))
-
-            term_indexer = get_term_indexer(str(output_dir))
-            term_indexer.add_document(
-                doc_id=current_doc_id,
-                terms_info=terms_info,
-                vector_indices=vector_indices
-            )
-            print(f"  术语索引已构建")
-        except Exception as e:
-            print(f"  术语索引构建失败: {e}")
-            import traceback
-            traceback.print_exc()
+    # 更新元数据（初始化在FAISS索引之前）
+    if existing_metadata:
+        chunks_metadata = existing_metadata
+        current_doc_id = max(m.get('doc_id', 0) for m in existing_metadata)
+        vector_index = max(m.get('vector_index', -1) for m in existing_metadata) + 1
+    else:
+        chunks_metadata = []
+        current_doc_id = 0
+        vector_index = 0
 
     # 处理FAISS索引
     print(f"\n更新向量库...")
@@ -273,15 +317,25 @@ def add_single_file(
     # 保存索引
     faiss.write_index(index, str(faiss_path))
 
-    # 更新元数据
-    if existing_metadata:
-        chunks_metadata = existing_metadata
-        current_doc_id = max(m.get('doc_id', 0) for m in existing_metadata)
-        vector_index = max(m.get('vector_index', -1) for m in existing_metadata) + 1
-    else:
-        chunks_metadata = []
-        current_doc_id = 0
-        vector_index = 0
+    # 构建术语索引
+    if terms_info:
+        print(f"\n构建术语索引...")
+        try:
+            # 计算该文档的向量索引范围
+            start_vector_idx = len(chunks_metadata) if chunks_metadata else 0
+            vector_indices = list(range(start_vector_idx, start_vector_idx + len(chunks)))
+
+            term_indexer = get_term_indexer(str(output_dir))
+            term_indexer.add_document(
+                doc_id=current_doc_id,
+                terms_info=terms_info,
+                vector_indices=vector_indices
+            )
+            print(f"  术语索引已构建")
+        except Exception as e:
+            print(f"  术语索引构建失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     current_doc_id += 1
     doc_meta = parsed['metadata']
@@ -490,9 +544,9 @@ def main():
         help='不提取文档属性'
     )
     parser.add_argument(
-        '--no-summary',
+        '--summary',
         action='store_true',
-        help='不生成文本概要'
+        help='生成文本概要（需要千问模型，默认禁用）'
     )
     parser.add_argument(
         '--no-db',
@@ -521,8 +575,50 @@ def main():
         action='store_true',
         help='不使用GPU加速向量化（使用CPU）'
     )
+    parser.add_argument(
+        '--stats',
+        action='store_true',
+        help='统计已向量化的文件并生成 Excel 报告'
+    )
+    parser.add_argument(
+        '--stats-output',
+        type=str,
+        default=None,
+        help='统计报告输出路径（默认：已向量化文件统计_时间戳.xlsx）'
+    )
 
     args = parser.parse_args()
+
+    # 处理统计命令
+    if args.stats:
+        # 导入统计函数
+        import sys
+        from pathlib import Path
+
+        # 添加当前目录到路径以导入统计函数
+        stats_module_path = Path(__file__).parent / "vectorized_files_stats.py"
+
+        # 动态导入统计函数
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vectorized_files_stats", stats_module_path)
+        stats_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stats_module)
+
+        # 构建元数据路径
+        output_dir = Path(args.output).resolve()
+        metadata_path = output_dir / "index" / "metadata.json"
+
+        # 调用统计函数
+        result = stats_module.generate_vectorized_files_excel(
+            metadata_path=str(metadata_path),
+            output_excel_path=args.stats_output,
+            print_details=True
+        )
+
+        # 打印结果
+        result_for_print = {k: v for k, v in result.items() if k != 'files'}
+        print(f"\nResult: {json.dumps(result_for_print, ensure_ascii=False, indent=2)}")
+        return
 
     # 处理清空向量库命令
     if args.clear:
@@ -553,7 +649,7 @@ def main():
             save_txt=not args.no_txt,
             txt_dir=args.txt_dir,
             extract_attributes=not args.no_attributes,
-            generate_summary_flag=not args.no_summary,
+            generate_summary_flag=args.summary,  # 默认False，需要显式 --summary 才启用
             save_to_db=not args.no_db,
             skip_existing=not args.force,
             use_gpu=not args.no_gpu
@@ -651,7 +747,32 @@ def clear_vector_index(
     else:
         print(f"  文件不存在: {metadata_path.name}")
 
-    # 3. 清空数据库记录（可选）
+    # 3. 删除术语索引文件
+    terms_index_path = output_dir / "terms_index.json"
+    if terms_index_path.exists():
+        try:
+            terms_index_path.unlink()
+            deleted_files.append(str(terms_index_path))
+            print(f"  已删除: {terms_index_path.name}")
+        except Exception as e:
+            errors.append(f"删除 {terms_index_path.name} 失败: {e}")
+            print(f"  错误: 无法删除 {terms_index_path.name}: {e}")
+    else:
+        print(f"  文件不存在: {terms_index_path.name}")
+
+    standard_index_path = output_dir / "standard_index.json"
+    if standard_index_path.exists():
+        try:
+            standard_index_path.unlink()
+            deleted_files.append(str(standard_index_path))
+            print(f"  已删除: {standard_index_path.name}")
+        except Exception as e:
+            errors.append(f"删除 {standard_index_path.name} 失败: {e}")
+            print(f"  错误: 无法删除 {standard_index_path.name}: {e}")
+    else:
+        print(f"  文件不存在: {standard_index_path.name}")
+
+    # 4. 清空数据库记录（可选）
     db_deleted_count = 0
     if clear_db:
         print(f"\n  清空数据库记录...")
@@ -709,7 +830,7 @@ def batch_add_files(
     save_txt: bool = True,
     txt_dir: str = "./txt",
     extract_attributes: bool = True,
-    generate_summary_flag: bool = True,
+    generate_summary_flag: bool = False,  # 默认禁用：需要千问模型，速度慢
     save_to_db: bool = True,
     skip_existing: bool = True,
     use_gpu: bool = True
@@ -803,7 +924,11 @@ def batch_add_files(
 
     # 逐个处理文件
     for i, file_path in enumerate(all_files, 1):
-        file_rel_path = str(file_path.relative_to(project_root)) if file_path.is_relative_to(project_root) else str(file_path)
+        # 安全地计算相对路径
+        try:
+            file_rel_path = str(file_path.relative_to(project_root))
+        except ValueError:
+            file_rel_path = str(file_path)
 
         print(f"\n{'='*70}")
         print(f"[{i}/{len(all_files)}] 处理: {file_path.name}")
@@ -2090,9 +2215,13 @@ import faiss
 
 
 if __name__ == "__main__":
-    #clear_vector_index()
-    batch_add_files(source_dir='E:/answerInfo/yiliaozsk1/file_info/test/标准', use_gpu=True)
-
+    # clear_vector_index(output_dir="E:/answerInfo/yiliaozsk1/file_info/test/data")
+    batch_add_files(
+        # source_dir="E:/项目/标准",
+        source_dir="E:/项目/法规",
+        output_dir="E:/answerInfo/yiliaozsk1/file_info/test/data",  # 使用根目录
+        skip_existing=False
+    )
 
 
 

@@ -293,10 +293,14 @@ class DocumentParser:
         import fitz  # PyMuPDF
 
         doc = fitz.open(file_path)
+        total_pages = len(doc)
         pages_text = []
         full_text_parts = []
 
+        print(f"  📄 PDF 总页数: {total_pages}")
+
         for page_num, page in enumerate(doc):
+            print(f"  📖 处理第 {page_num + 1}/{total_pages} 页...", end="", flush=True)
             page_text = ""
 
             # 方法1: 使用 text 模式提取（最可靠）
@@ -306,11 +310,12 @@ class DocumentParser:
                 # 检测是否是乱码
                 if self._is_valid_chinese_text(text):
                     page_text = text
+                    print(f" ✅ 文本提取成功 ({len(text)} 字符)")
                 else:
                     # 方法2: 尝试 blocks 模式并按位置排序
                     blocks = page.get_text("blocks")
                     if blocks:
-                        # 按 (y0, x0) 排序，确保阅读顺序正确（从上到下，从左到右）
+                        # 按 (y0, x0) 排序，确保阅读顺序正确（从上到下，从左到右)
                         sorted_blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
                         blocks_text = "\n".join([b[4] for b in sorted_blocks if b[4] and b[4].strip()])
                         if blocks_text:
@@ -341,11 +346,14 @@ class DocumentParser:
                     page_text = raw_text.strip()
 
             # ===== 提取并识别图片中的文字 =====
+            ocr_used = False
             if self.enable_ocr:
                 try:
                     # 获取页面中的图片列表
                     image_list = page.get_images()
                     if image_list:
+                        print(f" 🔍 发现 {len(image_list)} 张图片，使用 OCR 识别...", end="", flush=True)
+                        ocr_results = []
                         for img_index, img in enumerate(image_list):
                             try:
                                 # 获取图片的 xref
@@ -364,11 +372,18 @@ class DocumentParser:
                                     )
 
                                     if ocr_text:
-                                        page_text += f"\n{ocr_text}"
+                                        ocr_results.append(ocr_text)
 
                             except Exception as e:
                                 # 单个图片识别失败不影响其他图片
                                 continue
+
+                        if ocr_results:
+                            page_text += "\n" + "\n".join(ocr_results)
+                            print(f" ✅ OCR 识别成功")
+                            ocr_used = True
+                        else:
+                            print(f" ⚠️  OCR 未能识别文字")
                 except Exception as e:
                     # 图片提取失败不影响文本解析
                     pass
@@ -376,8 +391,11 @@ class DocumentParser:
             if page_text:
                 pages_text.append(page_text)
                 full_text_parts.append(page_text)
+                if not ocr_used:
+                    print(f" ✅ 完成")
 
         doc.close()
+        print(f"  📊 解析完成: 共 {total_pages} 页, {len(full_text_parts)} 页有效")
 
         full_text = "\n\n".join(full_text_parts)
 

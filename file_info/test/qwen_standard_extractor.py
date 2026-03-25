@@ -246,13 +246,13 @@ def call_ollama(prompt: str, model: str = None) -> str:
 
 
 # ============ 提取函数 ============
-def extract_text_from_pdf(pdf_path, max_pages=5, enable_ocr=True, ocr_threshold=100):
+def extract_text_from_pdf(pdf_path, max_pages=None, enable_ocr=True, ocr_threshold=100):
     """
     从 PDF 提取文本，支持扫描件 OCR 识别
 
     Args:
         pdf_path: PDF 文件路径
-        max_pages: 读取的最大页数
+        max_pages: 读取的最大页数，None表示读取全部页面
         enable_ocr: 是否启用 OCR（默认 True）
         ocr_threshold: 文本字符数低于此值时启用 OCR（默认 100）
 
@@ -262,9 +262,10 @@ def extract_text_from_pdf(pdf_path, max_pages=5, enable_ocr=True, ocr_threshold=
     doc = fitz.open(pdf_path)
     text_content = []
     ocr_engine = get_ocr_engine() if enable_ocr else None
+    total_pages = len(doc)
 
     for i, page in enumerate(doc):
-        if i >= max_pages:
+        if max_pages is not None and i >= max_pages:
             break
 
         # 1. 先尝试直接提取文本
@@ -273,16 +274,21 @@ def extract_text_from_pdf(pdf_path, max_pages=5, enable_ocr=True, ocr_threshold=
 
         # 2. 判断是否需要 OCR
         if len(text) < ocr_threshold and ocr_engine and ocr_engine.is_available():
-            print(f"   🔍 页面 {i+1} 文本较少，使用 OCR 识别...")
+            print(f"   🔍 页面 {i+1}/{total_pages} 文本较少({len(text)}字符)，使用 OCR 识别...")
             ocr_text = ocr_engine.recognize_pdf_page(page)
             if ocr_text:
                 text = ocr_text
                 print(f"   ✅ OCR 识别成功，提取 {len(text)} 字符")
             else:
                 print(f"   ⚠️  OCR 识别失败，使用原始文本")
+        elif text:
+            # 文本足够，直接使用
+            if max_pages is None or total_pages <= 10:
+                # 只在处理少量页面时显示进度
+                print(f"   📄 页面 {i+1}/{total_pages} 提取 {len(text)} 字符")
 
         if text:
-            text_content.append(text)
+            text_content.append(f"===== 第 {i+1} 页 =====\n{text}")
 
     doc.close()
     return "\n\n".join(text_content)
@@ -386,9 +392,21 @@ def batch_extract_standard_attributes(
     pdf_dir,
     output_file="提取结果_ollama.xlsx",
     model=None,
-    enable_ocr=True
+    enable_ocr=True,
+    save_txt=True,
+    txt_output_dir=None
 ):
-    """批量提取PDF标准属性"""
+    """
+    批量提取PDF标准属性并生成文本文件
+
+    Args:
+        pdf_dir: PDF文件目录
+        output_file: Excel输出文件路径
+        model: Ollama模型名称
+        enable_ocr: 是否启用OCR识别
+        save_txt: 是否保存每个PDF的txt文本文件（默认True）
+        txt_output_dir: txt文本文件输出目录，默认与Excel文件同目录
+    """
 
     from openpyxl import Workbook
     import openpyxl
@@ -413,12 +431,30 @@ def batch_extract_standard_attributes(
     ]
     ws.append(headers)
 
+    # 设置txt输出目录
+    if save_txt:
+        if txt_output_dir is None:
+            txt_output_dir = Path(output_file).parent / "txt文本"
+        else:
+            txt_output_dir = Path(txt_output_dir)
+        txt_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"📝 文本文件将保存到: {txt_output_dir}\n")
+
     # 批量处理
     results = []
-    for i, pdf_file in enumerate(pdf_files, 1):
-        print(f"[{i}/{len(pdf_files)}] ", end="")
+    txt_saved_count = 0
 
-        result = extract_standard_attributes(pdf_file, model=model, enable_ocr=enable_ocr)
+    for i, pdf_file in enumerate(pdf_files, 1):
+        print(f"[{i}/{len(pdf_files)}] {pdf_file.name}")
+
+        # 提取完整PDF文本内容（用于保存txt，包含所有页面）
+        print(f"   📖 提取完整文本内容...")
+        pdf_text_full = extract_text_from_pdf(pdf_file, max_pages=None, enable_ocr=enable_ocr)
+        total_chars = len(pdf_text_full)
+        print(f"   📊 总计提取 {total_chars} 字符")
+
+        # 提取标准属性（只取前5页即可）
+        result = extract_standard_attributes(pdf_file, max_pages=5, model=model, enable_ocr=enable_ocr)
 
         if result:
             result["文件名"] = pdf_file.name
@@ -428,9 +464,25 @@ def batch_extract_standard_attributes(
             row = [result.get(h, "") for h in headers]
             ws.append(row)
 
+        # 保存txt文本文件（即使属性提取失败也保存txt）
+        if save_txt and pdf_text_full.strip():
+            txt_filename = pdf_file.stem + ".txt"
+            txt_path = txt_output_dir / txt_filename
+            try:
+                with open(txt_path, 'w', encoding='utf-8') as f:
+                    f.write(pdf_text_full)
+                print(f"   💾 TXT已保存: {txt_filename} ({total_chars} 字符)")
+                txt_saved_count += 1
+            except Exception as e:
+                print(f"   ⚠️  TXT保存失败: {e}")
+
+        print()  # 换行
+
     # 保存Excel
     wb.save(output_file)
     print(f"\n✅ 完成！结果已保存到: {output_file}")
+    if save_txt:
+        print(f"📝 共保存 {txt_saved_count} 个文本文件到: {txt_output_dir}")
 
     return results
 
@@ -461,6 +513,7 @@ if __name__ == "__main__":
     else:
         # 批量处理
         batch_extract_standard_attributes(
-            pdf_dir="E:/answerInfo/yiliaozsk1/file_info/test/标准",
+            pdf_dir="E:/项目/标准",
+            # pdf_dir="E:/answerInfo/yiliaozsk1/file_info/test/标准",
             output_file="E:/answerInfo/yiliaozsk1/file_info/test/标准/提取结果_ollama.xlsx"
         )
