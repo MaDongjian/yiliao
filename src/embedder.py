@@ -12,10 +12,8 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
 
-# 禁用 CUDA（避免 CUDA DLL 依赖问题）
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-
 # 禁用 multiprocessing 和共享内存（避免 shm.dll 依赖问题）
+# 注意：不设置 CUDA_VISIBLE_DEVICES，允许向量化使用GPU
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -133,13 +131,22 @@ class EmbeddingModel:
             raise ImportError("请安装 sentence-transformers: pip install sentence-transformers")
 
         print(f"正在加载模型: {self.model_name}")
-        print(f"模型目录: {self.cache_dir}")
+
+        # 检查 model_name 是否是完整路径
+        model_path = Path(self.model_name)
+        if model_path.is_absolute() and model_path.exists():
+            # 直接传入完整路径，使用该路径加载
+            print(f"检测到完整路径，直接加载: {model_path}")
+            self.cache_dir = str(model_path.parent)
+        else:
+            # 使用相对路径和 cache_dir
+            model_path = Path(self.cache_dir)
+            print(f"模型目录: {self.cache_dir}")
 
         # 检查模型目录是否存在
-        model_path = Path(self.cache_dir)
         if not model_path.exists():
             raise FileNotFoundError(
-                f"模型目录不存在: {self.cache_dir}\n"
+                f"模型目录不存在: {model_path}\n"
                 f"请先运行下载脚本下载模型，或检查路径是否正确"
             )
 
@@ -151,12 +158,21 @@ class EmbeddingModel:
         # 尝试从本地加载模型
         try:
             try:
-                # 首先尝试直接从模型名称加载（使用缓存）
-                self.model = SentenceTransformer(
-                    self.model_name,
-                    cache_folder=self.cache_dir,
-                    device=self.device
-                )
+                # 检查是否是完整路径且包含 config.json
+                if Path(self.model_name).is_absolute() and (Path(self.model_name) / "config.json").exists():
+                    # 直接从完整路径加载
+                    print(f"从完整路径加载模型...")
+                    self.model = SentenceTransformer(
+                        str(self.model_name),
+                        device=self.device
+                    )
+                else:
+                    # 从缓存加载
+                    self.model = SentenceTransformer(
+                        self.model_name,
+                        cache_folder=self.cache_dir,
+                        device=self.device
+                    )
             except Exception as e:
                 # 如果失败，尝试其他加载方式
                 print(f"从缓存加载失败，尝试直接加载模型文件...")

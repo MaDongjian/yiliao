@@ -98,7 +98,7 @@ def add_single_file(
         raise FileNotFoundError(f"文件不存在: {file_path}")
 
     # 检查文件格式
-    supported_formats = {'.pdf', '.docx', '.pptx'}
+    supported_formats = {'.pdf', '.docx', '.pptx', '.doc'}
     if file_path.suffix.lower() not in supported_formats:
         raise ValueError(f"不支持的文件格式: {file_path.suffix}。支持的格式: {sorted(supported_formats)}")
 
@@ -867,7 +867,7 @@ def batch_add_files(
     output_dir = Path(output_dir)
 
     # 支持的文件格式
-    supported_formats = {'.pdf', '.docx', '.pptx'}
+    supported_formats = {'.pdf', '.docx', '.pptx', '.doc'}
 
     # 扫描所有支持的文件
     print(f"\n{'='*70}")
@@ -1208,7 +1208,7 @@ def upload_files_to_minio(
         }
 
     # 获取所有文件
-    supported_formats = {'.pdf', '.docx', '.pptx'}
+    supported_formats = {'.pdf', '.docx', '.pptx', '.doc'}
     files = [f for f in source_dir.iterdir() if f.is_file() and f.suffix.lower() in supported_formats]
 
     if not files:
@@ -1748,7 +1748,7 @@ def extract_file_attributes(
         }
 
     # 检查文件格式
-    supported_formats = {'.pdf', '.docx', '.pptx'}
+    supported_formats = {'.pdf', '.docx', '.pptx', '.doc'}
     if file_path.suffix.lower() not in supported_formats:
         return {
             'status': 'error',
@@ -2040,7 +2040,7 @@ def batch_extract_attributes_to_excel(
         output_excel_path = Path(output_excel_path)
 
     # 支持的文件格式
-    supported_formats = {'.pdf', '.docx', '.pptx'}
+    supported_formats = {'.pdf', '.docx', '.pptx', '.doc'}
 
     # 获取所有文件
     if recursive:
@@ -2217,8 +2217,8 @@ import faiss
 if __name__ == "__main__":
     # clear_vector_index(output_dir="E:/answerInfo/yiliaozsk1/file_info/test/data")
     batch_add_files(
-        # source_dir="E:/项目/标准",
-        source_dir="E:/项目/法规",
+        source_dir="E:/项目/未向量化标准",
+        # source_dir="E:/项目/法规",
         output_dir="E:/answerInfo/yiliaozsk1/file_info/test/data",  # 使用根目录
         skip_existing=False
     )

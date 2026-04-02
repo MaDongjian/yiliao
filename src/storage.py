@@ -122,8 +122,11 @@ class VectorStore:
         if len(chunks) != len(embeddings):
             raise ValueError(f"文本块数量 {len(chunks)} 与向量数量 {len(embeddings)} 不匹配")
 
-        # 生成文档ID
-        doc_id = len(self.documents_metadata) + 1
+        # 生成文档ID：取已有最大ID + 1，避免追加时ID重复
+        if self.documents_metadata:
+            doc_id = max(int(k) for k in self.documents_metadata.keys()) + 1
+        else:
+            doc_id = 1
 
         # 保存文档元数据（包含概要）
         self.documents_metadata[doc_id] = {

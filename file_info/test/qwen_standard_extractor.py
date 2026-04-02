@@ -3,6 +3,7 @@
 针对医疗标准文档优化的版本
 使用 Ollama 本地模型（无需联网）
 支持 PDF 扫描件 OCR 识别
+修复PDF编码乱码问题
 """
 
 import json
@@ -44,7 +45,10 @@ class OCREngine:
 
                 self.ocr_engine = PaddleOCR(
                     use_textline_orientation=True,
-                    lang='ch'
+                    lang='ch',
+                    use_angle_cls=False,  # 禁用方向分类器以减少内存占用
+                    show_log=False,  # 关闭日志输出
+                    use_gpu=False  # 强制使用CPU
                 )
             except ImportError:
                 print("警告: 未安装 PaddleOCR，无法识别扫描件")
@@ -100,25 +104,53 @@ class OCREngine:
         Returns:
             识别出的文本
         """
-        # 渲染页面为图片
-        mat = fitz.Matrix(2, 2)  # 放大2倍提高识别精度
-        pix = page.get_pixmap(matrix=mat)
-        img_data = pix.tobytes("png")
+        import gc
 
-        # 转换为 PIL Image
-        image = Image.open(io.BytesIO(img_data))
+        pix = None
+        img_data = None
+        image = None
+        img_array = None
 
-        # 转换为 RGB
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        try:
+            # 渲染页面为图片（降低倍率以减少内存占用）
+            mat = fitz.Matrix(1.5, 1.5)  # 从2倍降到1.5倍
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes("png")
 
-        # 转换为 numpy 数组
-        img_array = np.array(image)
+            # 转换为 PIL Image
+            image = Image.open(io.BytesIO(img_data))
 
-        # OCR 识别
-        texts = self.recognize_image(img_array)
+            # 转换为 RGB
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
 
-        return "\n".join(texts) if texts else ""
+            # 转换为 numpy 数组
+            img_array = np.array(image)
+
+            # OCR 识别
+            texts = self.recognize_image(img_array)
+
+            result = "\n".join(texts) if texts else ""
+            return result
+
+        except Exception as e:
+            print(f"OCR 识别失败: {e}")
+            return ""
+
+        finally:
+            # 显式清理资源，防止内存泄漏
+            if pix is not None:
+                del pix
+            if img_data is not None:
+                del img_data
+            if image is not None:
+                image.close()
+                del image
+            if img_array is not None:
+                del img_array
+
+            # 定期调用垃圾回收
+            gc.collect()
 
 
 # 全局 OCR 实例
@@ -245,16 +277,60 @@ def call_ollama(prompt: str, model: str = None) -> str:
         raise RuntimeError(f"Ollama API 调用失败: {e}")
 
 
-# ============ 提取函数 ============
-def extract_text_from_pdf(pdf_path, max_pages=None, enable_ocr=True, ocr_threshold=100):
+# ============ 乱码检测函数 ============
+def has_garbled_text(text):
     """
-    从 PDF 提取文本，支持扫描件 OCR 识别
+    检测文本是否包含乱码
+
+    通过检测特定的乱码特征字符来判断：
+    - 犐 (U+7290) - 错误映射的英文字母
+    - 犆 (U+7286)
+    - 犛 (U+725B)
+    - 狊 (U+72CA)
+    - 犠 (U+72A0)
+    - 狅 (U+72C5)
+    - 狀 (U+72C0)
+    - 犻 (U+72BB)
+    - 犵 (U+72B5)
+    - 犳 (U+72B3)
+    - 狔 (U+72D4)
+
+    Args:
+        text: 待检测的文本
+
+    Returns:
+        True 表示检测到乱码，False 表示文本正常
+    """
+    # 常见的PDF编码错误导致的乱码字符
+    garbled_chars = ['犐', '犆', '犛', '狊', '犠', '狅', '狀', '犻', '犵', '犳', '狔',
+                     '犾', '犮', '犱', '狋', '狀', '犪', '犫', '狉', '犽', '犿',
+                     '狀', '狆', 'q', '狊', '狋', '狌', '狏', '狑', '狓', '狔']
+
+    # 统计乱码字符出现次数
+    garbled_count = sum(1 for char in text if char in garbled_chars)
+
+    # 如果乱码字符超过一定阈值（文本长度的0.5%或至少出现5次），认为是乱码
+    text_len = len(text)
+    if text_len == 0:
+        return False
+
+    threshold_ratio = 0.005  # 0.5%
+    threshold_min = 5  # 至少5个乱码字符
+
+    return garbled_count >= threshold_min or (garbled_count / text_len) > threshold_ratio
+
+
+# ============ 提取函数 ============
+def extract_text_from_pdf(pdf_path, max_pages=None, enable_ocr=True, ocr_threshold=100, force_ocr_on_garble=True):
+    """
+    从 PDF 提取文本，支持扫描件 OCR 识别和乱码自动检测
 
     Args:
         pdf_path: PDF 文件路径
         max_pages: 读取的最大页数，None表示读取全部页面
         enable_ocr: 是否启用 OCR（默认 True）
         ocr_threshold: 文本字符数低于此值时启用 OCR（默认 100）
+        force_ocr_on_garble: 检测到乱码时强制使用 OCR（默认 True）
 
     Returns:
         提取的文本内容
@@ -263,32 +339,65 @@ def extract_text_from_pdf(pdf_path, max_pages=None, enable_ocr=True, ocr_thresho
     text_content = []
     ocr_engine = get_ocr_engine() if enable_ocr else None
     total_pages = len(doc)
+    use_ocr_for_all = False  # 检测到乱码后，对后续所有页面使用OCR
+
+    # 检测第一页是否有乱码，决定是否需要全程OCR
+    if total_pages > 0 and force_ocr_on_garble:
+        first_page = doc[0]
+        first_text = first_page.get_text()
+        if has_garbled_text(first_text):
+            print(f"   ⚠️  检测到PDF存在编码问题，将使用OCR识别所有页面...")
+            use_ocr_for_all = True
 
     for i, page in enumerate(doc):
         if max_pages is not None and i >= max_pages:
             break
 
+        page_num = i + 1
+
         # 1. 先尝试直接提取文本
         text = page.get_text()
         text = text.strip()
 
-        # 2. 判断是否需要 OCR
-        if len(text) < ocr_threshold and ocr_engine and ocr_engine.is_available():
-            print(f"   🔍 页面 {i+1}/{total_pages} 文本较少({len(text)}字符)，使用 OCR 识别...")
+        # 2. 判断是否需要使用 OCR
+        use_ocr_this_page = use_ocr_for_all
+
+        # 如果不是全局OCR模式，检测当前页面是否需要OCR
+        if not use_ocr_this_page:
+            # 检测乱码
+            if force_ocr_on_garble and has_garbled_text(text):
+                print(f"   🔍 页面 {page_num}/{total_pages} 检测到编码问题，使用 OCR 识别...")
+                use_ocr_this_page = True
+            # 文本太少也需要OCR
+            elif len(text) < ocr_threshold:
+                use_ocr_this_page = True
+
+        # 执行OCR
+        if use_ocr_this_page and ocr_engine and ocr_engine.is_available():
+            if len(text) >= ocr_threshold:
+                # 只在文本原本足够但检测到乱码时提示
+                if has_garbled_text(text):
+                    print(f"   🔍 页面 {page_num}/{total_pages} 检测到编码问题，使用 OCR 识别...")
+                else:
+                    print(f"   🔍 页面 {page_num}/{total_pages} 文本较少({len(text)}字符)，使用 OCR 识别...")
+
             ocr_text = ocr_engine.recognize_pdf_page(page)
             if ocr_text:
                 text = ocr_text
                 print(f"   ✅ OCR 识别成功，提取 {len(text)} 字符")
             else:
-                print(f"   ⚠️  OCR 识别失败，使用原始文本")
+                if use_ocr_for_all or has_garbled_text(page.get_text()):
+                    print(f"   ⚠️  OCR 识别失败，使用原始文本（可能存在乱码）")
+                else:
+                    print(f"   ⚠️  OCR 识别失败，使用原始文本")
         elif text:
-            # 文本足够，直接使用
+            # 文本足够且无乱码，直接使用
             if max_pages is None or total_pages <= 10:
                 # 只在处理少量页面时显示进度
-                print(f"   📄 页面 {i+1}/{total_pages} 提取 {len(text)} 字符")
+                print(f"   📄 页面 {page_num}/{total_pages} 提取 {len(text)} 字符")
 
         if text:
-            text_content.append(f"===== 第 {i+1} 页 =====\n{text}")
+            text_content.append(f"===== 第 {page_num} 页 =====\n{text}")
 
     doc.close()
     return "\n\n".join(text_content)
@@ -434,7 +543,7 @@ def batch_extract_standard_attributes(
     # 设置txt输出目录
     if save_txt:
         if txt_output_dir is None:
-            txt_output_dir = Path(output_file).parent / "txt文本"
+            txt_output_dir = Path(output_file).parent / "txt文本/txt文本1"
         else:
             txt_output_dir = Path(txt_output_dir)
         txt_output_dir.mkdir(parents=True, exist_ok=True)
@@ -447,14 +556,23 @@ def batch_extract_standard_attributes(
     for i, pdf_file in enumerate(pdf_files, 1):
         print(f"[{i}/{len(pdf_files)}] {pdf_file.name}")
 
-        # 提取完整PDF文本内容（用于保存txt，包含所有页面）
-        print(f"   📖 提取完整文本内容...")
-        pdf_text_full = extract_text_from_pdf(pdf_file, max_pages=None, enable_ocr=enable_ocr)
-        total_chars = len(pdf_text_full)
-        print(f"   📊 总计提取 {total_chars} 字符")
+        try:
+            # 提取完整PDF文本内容（用于保存txt，包含所有页面）
+            print(f"   📖 提取完整文本内容...")
+            pdf_text_full = extract_text_from_pdf(pdf_file, max_pages=None, enable_ocr=enable_ocr)
+            total_chars = len(pdf_text_full)
+            print(f"   📊 总计提取 {total_chars} 字符")
+        except Exception as e:
+            print(f"   ⚠️  文本提取失败: {e}")
+            pdf_text_full = ""
+            total_chars = 0
 
-        # 提取标准属性（只取前5页即可）
-        result = extract_standard_attributes(pdf_file, max_pages=5, model=model, enable_ocr=enable_ocr)
+        try:
+            # 提取标准属性（只取前5页即可）
+            result = extract_standard_attributes(pdf_file, max_pages=5, model=model, enable_ocr=enable_ocr)
+        except Exception as e:
+            print(f"   ⚠️  属性提取失败: {e}")
+            result = None
 
         if result:
             result["文件名"] = pdf_file.name
@@ -477,6 +595,12 @@ def batch_extract_standard_attributes(
                 print(f"   ⚠️  TXT保存失败: {e}")
 
         print()  # 换行
+
+        # 🔧 内存管理：每处理5个文件后清理一次内存
+        if i % 5 == 0:
+            import gc
+            gc.collect()
+            print(f"   🧹 已清理内存缓存 [{i}/{len(pdf_files)}]")
 
     # 保存Excel
     wb.save(output_file)
@@ -507,13 +631,14 @@ def test_single_file(pdf_path, model=None, enable_ocr=True):
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1:
-        # 单文件测试
-        test_single_file(sys.argv[1])
-    else:
-        # 批量处理
-        batch_extract_standard_attributes(
-            pdf_dir="E:/项目/标准",
-            # pdf_dir="E:/answerInfo/yiliaozsk1/file_info/test/标准",
-            output_file="E:/answerInfo/yiliaozsk1/file_info/test/标准/提取结果_ollama.xlsx"
-        )
+    test_single_file('E:/项目/全部文件/全部文件/YY 0054-2023 血液透析设备.pdf')
+    # if len(sys.argv) > 1:
+    #     # 单文件测试
+    #     test_single_file()
+    # else:
+    #     # 批量处理
+    #     batch_extract_standard_attributes(
+    #         #pdf_dir="E:/项目/提取标准文件/提取的标准文件/全部标准/",
+    #          pdf_dir="E:/陵水/test",
+    #         output_file="E:/answerInfo/yiliaozsk1/file_info/test/标准/提取结果_ollama.xlsx"
+    #     )
